@@ -54,6 +54,7 @@ class _TurnState:
     live_start: int = 0
     segment_index: int = 0
     last_window: list[str] = field(default_factory=list)
+    last_rendered: str = ""
     active: bool = False  # True after begin_prompt_session until next prompt
     choice_message_id: int | None = None
     choice_fingerprint: str | None = None
@@ -126,22 +127,52 @@ def new_lines_from_window(session: list[str], window: list[str]) -> list[str]:
     return list(window[idx + 1 :])
 
 
+def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
+    """New lines after a prompt baseline, tolerant of pane.read sliding windows."""
+    if not window:
+        return []
+    if not base:
+        return list(window)
+    if len(window) >= len(base) and window[: len(base)] == base:
+        return list(window[len(base) :])
+    # Scrolled: longest suffix(base) == prefix(window)
+    max_n = min(len(base), len(window))
+    for n in range(max_n, 0, -1):
+        if base[-n:] == window[:n]:
+            return list(window[n:])
+    # Last baseline line still visible somewhere in the window
+    last = base[-1]
+    try:
+        idx = len(window) - 1 - window[::-1].index(last)
+    except ValueError:
+        return []
+    return list(window[idx + 1 :])
+
+
 def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
+    """Fold a Gateway sliding window into this turn's session_lines.
+
+    Returns how many lines were appended. Identical windows are no-ops.
+    """
     window = str(snapshot or "").splitlines()
     if window == state.last_window:
         return 0
+    prev = list(state.last_window)
     state.last_window = list(window)
 
     if state.baseline_text is not None and not state.session_lines:
         base = state.baseline_text.splitlines()
-        if base and window[: len(base)] == base:
-            added = list(window[len(base) :])
-        elif base:
-            added = new_lines_from_window(list(base), window)
-        else:
-            added = list(window)
-    else:
+        added = _delta_from_baseline(base, window)
+        # Baseline scrolled completely off — fall back to delta vs previous push.
+        if not added and prev:
+            added = new_lines_from_window(prev, window)
+    elif state.session_lines:
         added = new_lines_from_window(state.session_lines, window)
+        if not added and prev:
+            # Session tip scrolled out of the 50-line window; advance from prev.
+            added = new_lines_from_window(prev, window)
+    else:
+        added = new_lines_from_window(prev, window) if prev else list(window)
 
     if added:
         state.session_lines.extend(added)
@@ -158,10 +189,14 @@ def session_body(baseline: str | None, current: str, max_lines: int) -> str:
     if base_lines and current_lines[: len(base_lines)] == base_lines:
         new_lines = current_lines[len(base_lines) :]
         if not new_lines:
-            return "\n".join(current_lines[-min(max_lines, 8) :])
+            return ""
         context = current_lines[max(0, len(base_lines) - 2) : len(base_lines)]
         return "\n".join((context + new_lines)[-max_lines:])
-    return "\n".join(current_lines[-max_lines:])
+    # Sliding window after prompt: only the delta, not the whole tip.
+    delta = _delta_from_baseline(base_lines, current_lines)
+    if delta:
+        return "\n".join(delta[-max_lines:])
+    return ""
 
 
 def render_chat_reply(
@@ -176,7 +211,8 @@ def render_chat_reply(
     if continued and body:
         body = f"（续）\n{body}"
     if not body:
-        body = "…"
+        # Never replace an on-screen 「思考中…」 with a bare ellipsis via edit.
+        body = PLACEHOLDER if live else "…"
     elif live and str(status).lower() in {"working", "unknown", ""}:
         if not body.endswith("…"):
             body = f"{body}\n…"
@@ -260,6 +296,7 @@ async def begin_prompt_session(
     state.live_start = 0
     state.segment_index = 0
     state.last_window = []
+    state.last_rendered = PLACEHOLDER
     state.active = True
     state.status = "working"
     state.choice_fingerprint = None
@@ -341,7 +378,8 @@ async def apply_terminal_view(
 
     # Chatbot mode: ignore background Pane noise until the user sends a message.
     if not state.active and not force:
-        absorb_gateway_window(state, text)  # keep baseline fresh
+        # Keep last snapshot so the next turn's baseline is fresh; do not touch Discord.
+        state.last_window = str(text or "").splitlines()
         state.session_lines = []
         return state.message_id
 
@@ -349,7 +387,8 @@ async def apply_terminal_view(
         state.message_id = message_id
 
     added = absorb_gateway_window(state, text)
-    if added == 0 and not force and state.message_id is not None and state.session_lines:
+    # Nothing new since the prompt — keep 「思考中…」, do not edit to "…".
+    if added == 0 and not force:
         return state.message_id
 
     now = clock()
@@ -419,9 +458,15 @@ async def _flush(
     if not state.session_lines and state.text:
         absorb_gateway_window(state, state.text)
 
+    # Still waiting for Pane output after the user prompt.
+    if not state.session_lines[state.live_start :]:
+        return state.message_id
+
     try:
         while True:
             live_lines = state.session_lines[state.live_start :]
+            if not live_lines:
+                return state.message_id
             continued = state.segment_index > 0
             content = render_chat_reply(
                 live_lines,
@@ -429,8 +474,13 @@ async def _flush(
                 continued=continued,
                 live=True,
             )
+            if content == state.last_rendered and not state.needs_new_message:
+                state.last_edit = clock()
+                return state.message_id
+
             if len(content) <= SOFT_LIMIT or len(live_lines) <= 1:
                 await _edit_live(thread, state, content)
+                state.last_rendered = content
                 state.last_edit = clock()
                 return state.message_id
 
@@ -445,6 +495,7 @@ async def _flush(
                 live=False,
             )
             await _edit_live(thread, state, sealed)
+            state.last_rendered = sealed
             state.live_start += fit
             state.segment_index += 1
             state.message_id = None

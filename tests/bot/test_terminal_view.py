@@ -150,3 +150,58 @@ async def test_deferred_task_flush():
     # Drive the scheduled flush with the same clock (task uses real sleep; flush manually).
     await flush_terminal_view(thread, "p1", cfg, clock=clock.now)
     assert "two" in _text(reply.edit.await_args)
+
+
+@pytest.mark.asyncio
+async def test_same_snapshot_keeps_thinking_placeholder():
+    clock = FakeClock(1000.0)
+    thread = AsyncMock()
+    thread.id = 5
+    reply = MagicMock(id=9, edit=AsyncMock())
+    prompt = MagicMock(id=3)
+    prompt.reply = AsyncMock(return_value=reply)
+    thread.fetch_message = AsyncMock(return_value=reply)
+    cfg = _bridge(edit_cooldown=0.0)
+
+    await begin_prompt_session(thread, "p1", prompt, remote_id="r")
+    state = get_terminal_state(thread, "p1")
+    state.baseline_text = "line1\nline2"
+    state.text = "line1\nline2"
+    await apply_terminal_view(
+        thread, "p1", "line1\nline2", "working", cfg, clock=clock.now
+    )
+    reply.edit.assert_not_awaited()
+    assert state.message_id == 9
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_still_streams_new_lines():
+    clock = FakeClock(1000.0)
+    thread = AsyncMock()
+    thread.id = 6
+    reply = MagicMock(id=11, edit=AsyncMock())
+    prompt = MagicMock(id=4)
+    prompt.reply = AsyncMock(return_value=reply)
+    thread.fetch_message = AsyncMock(return_value=reply)
+    cfg = _bridge(edit_cooldown=0.0)
+
+    await begin_prompt_session(thread, "p1", prompt, remote_id="r")
+    state = get_terminal_state(thread, "p1")
+    # 50-line-style window: baseline tip then scroll introducing agent output.
+    base = [f"L{i}" for i in range(10)]
+    state.baseline_text = "\n".join(base)
+    state.session_lines = []
+    state.last_window = []
+
+    await apply_terminal_view(
+        thread, "p1", "\n".join(base), "working", cfg, clock=clock.now
+    )
+    reply.edit.assert_not_awaited()
+
+    scrolled = base[2:] + ["agent says hi"]
+    await apply_terminal_view(
+        thread, "p1", "\n".join(scrolled), "working", cfg, clock=clock.now
+    )
+    reply.edit.assert_awaited()
+    assert "agent says hi" in _text(reply.edit.await_args)
+    assert "思考中" not in _text(reply.edit.await_args)
