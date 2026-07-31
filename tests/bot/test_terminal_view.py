@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.bot.config import BridgeConfig, TerminalConfig
-from src.bot.terminal_view import apply_terminal_view, clear_terminal_state, flush_terminal_view
+from src.bot.terminal_view import (
+    apply_terminal_view,
+    begin_prompt_session,
+    clear_terminal_state,
+    flush_terminal_view,
+    session_body,
+)
 
 
 class FakeClock:
@@ -28,6 +34,7 @@ def _make_thread(*, message_id: int = 42) -> tuple[AsyncMock, MagicMock]:
     msg = MagicMock()
     msg.id = message_id
     msg.edit = AsyncMock()
+    msg.reply = AsyncMock()
     thread.fetch_message = AsyncMock(return_value=msg)
     thread.send = AsyncMock(return_value=msg)
     return thread, msg
@@ -56,6 +63,16 @@ def _reset_terminal_state():
 
 def _bridge(*, edit_cooldown: float = 2.0) -> BridgeConfig:
     return BridgeConfig(terminal=TerminalConfig(edit_cooldown=edit_cooldown))
+
+
+def test_session_body_prefers_new_lines_after_baseline():
+    baseline = "a\nb\nc"
+    current = "a\nb\nc\nd\ne"
+    assert session_body(baseline, current, 50) == "b\nc\nd\ne"
+
+
+def test_session_body_falls_back_when_baseline_missing():
+    assert session_body(None, "1\n2\n3\n4", 2) == "3\n4"
 
 
 @pytest.mark.asyncio
@@ -160,3 +177,43 @@ async def test_reuses_existing_message_id():
     thread.send.assert_not_awaited()
     thread.fetch_message.assert_awaited_once_with(99)
     msg.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_begin_prompt_session_replies_and_freezes_previous():
+    clock = FakeClock(1000.0)
+    thread = AsyncMock()
+    thread.id = 1001
+    first = MagicMock()
+    first.id = 10
+    first.edit = AsyncMock()
+    second = MagicMock()
+    second.id = 20
+    second.edit = AsyncMock()
+    thread.send = AsyncMock(return_value=first)
+
+    async def fetch(mid: int):
+        return {10: first, 20: second}[mid]
+
+    thread.fetch_message = AsyncMock(side_effect=fetch)
+    cfg = _bridge(edit_cooldown=0.0)
+
+    await apply_terminal_view(thread, "p1", "old", "idle", cfg, clock=clock.now, remote_id="r")
+    assert thread.send.await_count == 1
+
+    prompt = MagicMock()
+    prompt.id = 99
+    prompt.reply = AsyncMock(return_value=second)
+    await begin_prompt_session(thread, "p1", prompt, remote_id="r")
+
+    mid = await apply_terminal_view(
+        thread, "p1", "old\nnew", "working", cfg, clock=clock.now, remote_id="r", message_id=10
+    )
+    assert mid == 20
+    prompt.reply.assert_awaited_once()
+    first.edit.assert_not_awaited()
+    clock.advance(1.0)
+    await apply_terminal_view(
+        thread, "p1", "old\nnew\nmore", "working", cfg, clock=clock.now, remote_id="r"
+    )
+    second.edit.assert_awaited()

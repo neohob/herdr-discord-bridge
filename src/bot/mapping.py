@@ -101,7 +101,7 @@ class MappingStore:
             rm.panes[mapping.pane_id] = mapping
             self.save()
 
-    def set_terminal_message(self, remote_id: str, pane_id: str, message_id: int) -> None:
+    def set_terminal_message(self, remote_id: str, pane_id: str, message_id: int | None) -> None:
         with self._lock:
             pm = self.get_pane(remote_id, pane_id)
             if pm is None:

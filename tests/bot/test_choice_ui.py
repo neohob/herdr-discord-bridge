@@ -24,8 +24,9 @@ async def test_choice_view_allows_operator_interaction() -> None:
         guild_permissions=SimpleNamespace(manage_guild=True),
         roles=[],
     )
+    from src.bot.choice_ui import _check_operator
 
-    allowed = await BlockedChoiceView("lab", "w1:p1").interaction_check(_interaction(member=member))
+    allowed = await _check_operator(_interaction(member=member))
 
     assert allowed is True
 
@@ -38,8 +39,9 @@ async def test_choice_view_rejects_non_operator_interaction() -> None:
         roles=[],
     )
     interaction = _interaction(member=member)
+    from src.bot.choice_ui import _check_operator
 
-    allowed = await BlockedChoiceView("lab", "w1:p1").interaction_check(interaction)
+    allowed = await _check_operator(interaction)
 
     assert allowed is False
     interaction.response.send_message.assert_awaited_once_with(
@@ -56,3 +58,5 @@ def test_choice_view_is_persistent_and_encodes_target_in_custom_ids() -> None:
         child.custom_id == _choice_custom_id("lab", "w1:p1", action)
         for child, action in zip(view.children, ("yes", "no", "custom"), strict=True)
     )
+    # Layout-only buttons: no custom action attribute (clicks go to PersistentChoiceButton).
+    assert all(not hasattr(child, "action") for child in view.children)

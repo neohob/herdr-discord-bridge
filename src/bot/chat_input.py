@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from src.bot.choice_ui import clear_choice_message
+from src.bot.terminal_view import begin_prompt_session
+
 log = logging.getLogger(__name__)
 
 
@@ -17,7 +20,8 @@ async def on_message(bot: Any, message: Any) -> None:
     if not text or _is_command(bot, text):
         return
 
-    thread_id = getattr(getattr(message, "channel", None), "id", None)
+    channel = getattr(message, "channel", None)
+    thread_id = getattr(channel, "id", None)
     pane = bot.mapping.find_by_thread(thread_id)
     if pane is None:
         return
@@ -27,6 +31,12 @@ async def on_message(bot: Any, message: Any) -> None:
     if client is None:
         log.warning("ignoring input for offline remote %s", pane.remote_id)
         return
+
+    # Open a new live terminal reply under this prompt; dismiss stale choices.
+    await clear_choice_message(channel, pane.pane_id, note="_(superseded by new prompt)_")
+    await begin_prompt_session(channel, pane.pane_id, message, remote_id=pane.remote_id)
+    # Force the next terminal push to create a new message (not edit the old live).
+    bot.mapping.set_terminal_message(pane.remote_id, pane.pane_id, None)
 
     try:
         await client.send_input(pane.pane_id, text, keys=["enter"])

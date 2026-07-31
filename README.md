@@ -211,8 +211,9 @@ docker compose up -d --build
 
 | 操作 | 方式 |
 |------|------|
-| 向 Pane 发命令 | 在对应**线程**里发消息（机器人会 `send_text` + `Enter`） |
-| 看终端 | 线程内 Terminal Message 自动更新 |
+| 向 Pane 发命令 | 在对应**线程**里发消息（机器人会 `send_text` + `Enter`）；终端结果会 **reply 跟在该消息下面**并持续刷新，下一条消息再开新回复 |
+| Approve / 选择 | 出现 `blocked` 或终端确认提示（如 Do you want to proceed）时，在结果下方出 Yes/No/Custom（仅 Operator） |
+| 看终端 | 跟在 prompt 后的 Terminal 回复（旧回复保留在历史里） |
 | 列表 / 读写 | `/herdr pane list\|read\|…` |
 | 状态 | `/herdr status` |
 | 换绑频道 | 在新频道 `/herdr rebind` |

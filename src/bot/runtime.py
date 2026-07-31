@@ -8,14 +8,15 @@ from typing import Any, Protocol
 
 import discord
 
-from src.bot.choice_ui import blocked_view
+from src.bot.choice_detect import choice_fingerprint, is_blocked_status
+from src.bot.choice_ui import clear_choice_message, ensure_choice_message
 from src.bot.config import AppConfig
 from src.bot.discord_map import thread_name_for
 from src.bot.gateway_client import GatewayClient
 from src.bot.herdr.models import PaneInfo
 from src.bot.mapping import MappingStore, PaneMapping
 from src.bot.registry import RemoteRecord, RemoteRegistry
-from src.bot.terminal_view import apply_terminal_view
+from src.bot.terminal_view import apply_terminal_view, get_terminal_state
 
 log = logging.getLogger(__name__)
 
@@ -147,17 +148,27 @@ class Runtime:
         thread = await self._fetch_thread(pane.thread_id)
         if thread is None:
             return
+        text = str(data.get("text") or "")
+        status = str(data.get("agent_status") or pane.agent_status or "unknown")
         message_id = await apply_terminal_view(
             thread,
             pane_id,
-            str(data.get("text") or ""),
-            str(data.get("agent_status") or pane.agent_status or "unknown"),
+            text,
+            status,
             self.config.bridge,
             remote_id=remote_id,
             message_id=pane.terminal_message_id,
         )
         if message_id is not None:
             self.mapping.set_terminal_message(remote_id, pane_id, message_id)
+        await self._sync_choice_ui(
+            thread,
+            remote_id=remote_id,
+            pane_id=pane_id,
+            status=status,
+            text=text,
+            revision=data.get("revision"),
+        )
 
     async def _handle_status_change(self, remote_id: str, data: dict[str, Any]) -> None:
         pane_id = _pane_id(data)
@@ -186,15 +197,40 @@ class Runtime:
             except discord.HTTPException:
                 log.exception("failed renaming pane thread %s:%s", remote_id, pane_id)
 
-        if status == "blocked":
-            if thread is not None:
-                try:
-                    await thread.send(
-                        f"🔴 `{remote_id}:{pane_id}` is blocked. Choose a response:",
-                        view=blocked_view(remote_id, pane_id),
-                    )
-                except discord.HTTPException:
-                    log.exception("failed sending blocked choice UI")
+            state = get_terminal_state(thread, pane_id)
+            await self._sync_choice_ui(
+                thread,
+                remote_id=remote_id,
+                pane_id=pane_id,
+                status=status,
+                text=state.text,
+                revision=None,
+            )
+
+    async def _sync_choice_ui(
+        self,
+        thread: Any,
+        *,
+        remote_id: str,
+        pane_id: str,
+        status: str,
+        text: str,
+        revision: Any,
+    ) -> None:
+        fp = choice_fingerprint(status=status, text=text, revision=revision)
+        if fp is None:
+            state = get_terminal_state(thread, pane_id)
+            if state.choice_message_id is not None and not is_blocked_status(status):
+                await clear_choice_message(thread, pane_id, note="_(no longer waiting)_")
+            return
+        reason = "blocked" if is_blocked_status(status) else "approval prompt detected"
+        await ensure_choice_message(
+            thread,
+            remote_id=remote_id,
+            pane_id=pane_id,
+            fingerprint=fp,
+            content=f"🔴 `{remote_id}:{pane_id}` — {reason}. Choose a response:",
+        )
 
     async def _notify_lifecycle(
         self,
