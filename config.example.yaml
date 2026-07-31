@@ -1,7 +1,15 @@
+# Copy to config.yaml and set guild_id / operators before `docker compose up`.
+# Remotes are normally registered via /herdr in Discord (host, port, token, TLS fingerprint).
+
 discord:
   token: "${DISCORD_TOKEN}"
   guild_id: 0          # replace with your Discord server ID
   home_channel_id: 0   # optional: channel for ready / reconnect alerts
+
+operators:
+  require_manage_guild: true
+  user_ids: []         # optional allowlist; empty = any admin/role match
+  role_ids: []         # Discord role IDs that count as operator
 
 bridge:
   category_prefix: "remote:"
@@ -19,12 +27,10 @@ bridge:
   sync_interval: 300
   read_only: false
 
-# Paste snippets from scripts/setup-remote-ssh.sh on each Herdr host.
-# In Docker Compose, put private keys under ./keys and use /app/keys/... below.
-remotes:
-  - id: example-host
-    host: 192.168.1.10
-    port: 22
-    user: neo
-    ssh_key: /app/keys/id_ed25519_discord_bridge_example-host
-    herdr_socket: ~/.config/herdr/herdr.sock
+# Optional one-time seeds for cache/remotes.json on first run (registry wins afterwards).
+# seed_remotes:
+#   - id: example-host
+#     host: 192.168.1.10
+#     port: 8787
+#     token: "${GATEWAY_TOKEN}"
+#     fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

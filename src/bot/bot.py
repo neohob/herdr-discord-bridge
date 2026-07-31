@@ -1,8 +1,7 @@
-"""Discord bot entrypoint for Herdr Discord Bridge."""
+"""Discord bot entrypoint for the Gateway-backed Herdr Discord Bridge."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sys
@@ -11,13 +10,19 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from src.bot.bridge.channel_manager import ChannelManager
-from src.bot.bridge.commands import register_commands
-from src.bot.bridge.event_loop import RemoteBridgeLoop
-from src.bot.bridge.mapping import MappingStore
+from src.bot.chat_input import on_message as forward_chat_input
+from src.bot.choice_ui import PersistentChoiceButton
+from src.bot.commands import register_commands
 from src.bot.config import AppConfig, load_config
-from src.bot.herdr.client import HerdrClient
-from src.bot.ssh.manager import SshManager
+from src.bot.gateway_client import GatewayClient
+from src.bot.lifecycle import (
+    on_guild_channel_delete as handle_channel_delete,
+    on_raw_thread_delete as handle_raw_thread_delete,
+    on_thread_delete as handle_thread_delete,
+)
+from src.bot.mapping import MappingStore
+from src.bot.registry import RemoteRegistry
+from src.bot.runtime import Runtime
 
 log = logging.getLogger(__name__)
 
@@ -26,22 +31,39 @@ class BridgeBot(commands.Bot):
     def __init__(self, config: AppConfig):
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.message_content = False
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
-        self.ssh = SshManager(config.remotes)
         self.mapping = MappingStore(config.mapping_path)
-        self.channels: ChannelManager | None = None
-        self.herdr_clients: dict[str, HerdrClient] = {}
-        self.loops: dict[str, RemoteBridgeLoop] = {}
+        self.registry = RemoteRegistry(config.registry_path)
+        self.runtime: Runtime | None = None
+        self.add_listener(self._forward_chat_input, "on_message")
+        self.add_listener(self._handle_channel_delete, "on_guild_channel_delete")
+        self.add_listener(self._handle_thread_delete, "on_thread_delete")
+        self.add_listener(self._handle_raw_thread_delete, "on_raw_thread_delete")
 
-    def require_client(self, remote_id: str) -> HerdrClient:
-        client = self.herdr_clients.get(remote_id)
+    def require_client(self, remote_id: str) -> GatewayClient:
+        client = self.runtime.clients.get(remote_id) if self.runtime else None
         if client is None:
             raise RuntimeError(f"remote `{remote_id}` is not connected")
         return client
 
+    async def _forward_chat_input(self, message: discord.Message) -> None:
+        await forward_chat_input(self, message)
+
+    async def _handle_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        await handle_channel_delete(self, channel)
+
+    async def _handle_thread_delete(self, thread: discord.Thread) -> None:
+        await handle_thread_delete(self, thread)
+
+    async def _handle_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        await handle_raw_thread_delete(self, payload)
+
     async def setup_hook(self) -> None:
+        # Dynamic persistent components recover blocked-choice callbacks from
+        # their encoded remote/pane IDs after a process restart.
+        self.add_dynamic_items(PersistentChoiceButton)
         register_commands(self.tree, self)
         if self.config.discord.guild_id:
             guild = discord.Object(id=self.config.discord.guild_id)
@@ -60,45 +82,22 @@ class BridgeBot(commands.Bot):
             log.error("no guild available; invite the bot and set discord.guild_id")
             return
 
-        self.channels = ChannelManager(guild, self.config, self.mapping)
-        results = await self.ssh.connect_all()
-        for session in self.ssh.all():
-            err = results.get(session.id)
-            if err is not None:
-                await self._alert(f"SSH failed for `{session.id}`: `{err}`")
-                continue
-            client = HerdrClient(session)
-            try:
-                pong = await client.ping()
-                log.info("herdr ping %s -> %s", session.id, pong)
-            except Exception as exc:  # noqa: BLE001
-                await self._alert(f"Herdr ping failed for `{session.id}`: `{exc}`")
-                continue
-            self.herdr_clients[session.id] = client
-            loop = RemoteBridgeLoop(session, config=self.config, channels=self.channels)
-            self.loops[session.id] = loop
-            try:
-                await loop.start()
-            except Exception as exc:  # noqa: BLE001
-                log.exception("bridge loop start failed %s", session.id)
-                await self._alert(f"Bridge start failed `{session.id}`: `{exc}`")
+        if self.runtime is None:
+            self.runtime = Runtime(
+                self.config,
+                guild,
+                registry=self.registry,
+                mapping=self.mapping,
+            )
+        try:
+            await self.runtime.start()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start Gateway runtime")
+            await self._alert("Gateway runtime failed to start; see bridge logs.")
+            return
 
-        online = ", ".join(f"`{rid}`" for rid in self.herdr_clients) or "_none_"
-        await self._alert(f"Herdr Discord Bridge ready. Remotes: {online}")
-
-        if self.config.bridge.sync_interval > 0:
-            self.loop.create_task(self._periodic_sync())
-
-    async def _periodic_sync(self) -> None:
-        while not self.is_closed():
-            await asyncio.sleep(self.config.bridge.sync_interval)
-            if self.channels is None:
-                continue
-            for rid, client in list(self.herdr_clients.items()):
-                try:
-                    await self.channels.sync_remote(client)
-                except Exception:  # noqa: BLE001
-                    log.exception("periodic sync failed %s", rid)
+        online = ", ".join(f"`{rid}`" for rid in self.runtime.clients) or "_none_"
+        await self._alert(f"Herdr Discord Bridge ready. Gateway remotes: {online}")
 
     async def _alert(self, message: str) -> None:
         log.info(message)
@@ -118,9 +117,8 @@ class BridgeBot(commands.Bot):
                 log.exception("alert send failed")
 
     async def close(self) -> None:
-        for loop in self.loops.values():
-            await loop.stop()
-        await self.ssh.close_all()
+        if self.runtime is not None:
+            await self.runtime.stop()
         await super().close()
 
 

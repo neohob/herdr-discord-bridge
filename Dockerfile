@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ /app/src/
 COPY pyproject.toml /app/pyproject.toml
 
-RUN mkdir -p /app/cache /app/logs /app/keys \
+RUN mkdir -p /app/cache /app/logs \
     && useradd -m appuser \
     && chown -R appuser:appuser /app
 

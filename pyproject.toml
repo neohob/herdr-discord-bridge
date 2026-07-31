@@ -1,13 +1,19 @@
 [project]
 name = "herdr-discord-bridge"
 version = "0.1.0"
-description = "Discord bot bridge to remote Herdr sessions over SSH"
+description = "Discord bot bridge to remote Herdr sessions over a TLS gateway"
 readme = "docs/superpowers/specs/2026-07-31-herdr-discord-bridge-design.md"
 requires-python = ">=3.13"
 dependencies = [
+  "cryptography>=42",
   "discord.py>=2.4.0",
   "pyyaml>=6.0",
-  "asyncssh>=2.14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
 ]
 
 [project.scripts]

@@ -6,9 +6,8 @@ __pycache__/
 config.yaml
 .env
 cache/mapping.json
+cache/remotes.json
 logs/*.log
-keys/*
-!keys/.gitkeep
 *.pem
 id_ed25519*
 
