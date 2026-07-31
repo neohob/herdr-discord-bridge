@@ -121,12 +121,38 @@ class GatewayClient:
             {"pane_id": pane_id, "enable": enable},
         )
 
-    async def send_input(self, pane_id: str, text: str, *, keys: list[str]) -> Any:
-        """Send text and key presses to a Herdr Pane through the control RPC."""
-        return await self.request(
-            "pane.send_input",
-            {"pane_id": pane_id, "text": text, "keys": keys},
-        )
+    async def send_input(self, pane_id: str, text: str, *, keys: list[str] | None = None) -> Any:
+        """Type text into a Herdr Pane, then submit with Enter.
+
+        On Herdr 0.7:
+        - trailing ``\\n`` only inserts a line break (does not run the command)
+        - ``submit: true`` is accepted but does not execute
+        - reliable path: ``pane.send_text`` then ``pane.send_keys`` ``Enter``
+        """
+        keys = list(keys or [])
+        wants_enter = any(
+            str(key).lower() in {"enter", "return", "\r", "\n", "c-m"} for key in keys
+        ) or not keys
+        extra_keys = [
+            key
+            for key in keys
+            if str(key).lower() not in {"enter", "return", "\r", "\n", "c-m"}
+        ]
+        text = text.rstrip("\r\n")
+        result: Any = None
+        if text:
+            result = await self.request("pane.send_text", {"pane_id": pane_id, "text": text})
+        if extra_keys:
+            result = await self.request(
+                "pane.send_keys",
+                {"pane_id": pane_id, "keys": extra_keys},
+            )
+        if wants_enter:
+            result = await self.request(
+                "pane.send_keys",
+                {"pane_id": pane_id, "keys": ["Enter"]},
+            )
+        return result
 
     def _mark_control_lost(self) -> None:
         self._control_ready.clear()

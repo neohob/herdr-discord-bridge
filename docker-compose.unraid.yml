@@ -1,0 +1,30 @@
+# Unraid: 机器人/Gateway 与 Tailscale-Docker 共用网络（做法 A）
+# 前提：容器名恰好为 Tailscale-Docker，且已启动。
+#
+#   docker compose -f docker-compose.unraid.yml up -d --build
+#
+# 注意：network_mode: container:* 时不能再写 ports/networks。
+
+services:
+  herdr-discord-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: herdr-discord-bridge:local
+    container_name: herdr-discord-bridge
+    restart: unless-stopped
+    network_mode: "container:Tailscale-Docker"
+    depends_on: []
+    volumes:
+      - /mnt/user/appdata/herdr-discord-bridge/config.yaml:/app/config.yaml:ro
+      - /mnt/user/appdata/herdr-discord-bridge/cache:/app/cache
+      - /mnt/user/appdata/herdr-discord-bridge/logs:/app/logs
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - BRIDGE_CONFIG=/app/config.yaml
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"

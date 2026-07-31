@@ -96,10 +96,30 @@ async def test_ensure_pane_thread_creates_thread(tmp_path):
 
 def test_thread_name_includes_status_emoji():
     pane = PaneInfo(
-        pane_id="w1:p1",
-        workspace_id="w1",
-        label="agent",
-        agent_status="working",
+        pane_id="wB:p6",
+        workspace_id="wB",
+        label="Cursor Agent",
+        agent="cursor",
+        agent_status="idle",
+        workspace_label="JinAn-MAP",
+        tab_label="cursor",
     )
     name = thread_name_for(pane, BridgeConfig())
-    assert name.startswith("🔵")
+    assert name.startswith("🟢")
+    assert "JinAn-MAP" in name
+    assert "cursor" in name
+    assert "[wB:p6]" in name
+
+
+def test_pane_label_prefers_terminal_title_and_cwd():
+    from src.bot.herdr.models import PaneInfo as PI
+
+    pane = PI.from_dict(
+        {
+            "pane_id": "wA:p1",
+            "workspace_id": "wA",
+            "terminal_title_stripped": "neo@host:~/Downloads/MyNextCloud/Work/ShangLin/2026/HGT/codes",
+            "cwd": "/Users/neo/Work/ShangLin/2026/HGT/codes",
+        }
+    )
+    assert pane.label == "codes"

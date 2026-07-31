@@ -2,24 +2,34 @@
 id = "herdr-discord-bridge"
 name = "Discord Bridge Gateway"
 version = "0.1.0"
+min_herdr_version = "0.7.0"
 description = "TLS NDJSON gateway for Discord Bot ↔ Herdr bridging"
+platforms = ["linux", "macos"]
 
-[actions.setup]
-script = "scripts/ctl.sh"
-args = ["setup"]
+[[actions]]
+id = "setup"
+title = "Setup Gateway"
+description = "Generate token, TLS cert, and config for Discord /herdr register"
+command = ["bash", "scripts/ctl.sh", "setup"]
 
-[actions.start]
-script = "scripts/ctl.sh"
-args = ["start"]
+[[actions]]
+id = "start"
+title = "Start Gateway"
+description = "Start the TLS Gateway process"
+command = ["bash", "scripts/ctl.sh", "start"]
 
-[actions.stop]
-script = "scripts/ctl.sh"
-args = ["stop"]
+[[actions]]
+id = "stop"
+title = "Stop Gateway"
+command = ["bash", "scripts/ctl.sh", "stop"]
 
-[actions.status]
-script = "scripts/ctl.sh"
-args = ["status"]
+[[actions]]
+id = "status"
+title = "Gateway Status"
+command = ["bash", "scripts/ctl.sh", "status"]
 
-[actions.teardown]
-script = "scripts/ctl.sh"
-args = ["teardown"]
+[[actions]]
+id = "teardown"
+title = "Teardown Gateway"
+description = "Stop Gateway and remove generated config/certs"
+command = ["bash", "scripts/ctl.sh", "teardown"]

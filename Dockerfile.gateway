@@ -1,0 +1,33 @@
+# Herdr Discord Bridge — Gateway only (Unraid / DockerMan)
+FROM python:3.13-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir "cryptography>=42" "pyyaml>=6.0"
+
+COPY src/shared /app/src/shared
+COPY src/plugin /app/src/plugin
+COPY pyproject.toml /app/pyproject.toml
+COPY docker/gateway-entrypoint.sh /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh && mkdir -p /config /herdr
+
+# Run as root so host-mounted herdr.sock permissions are simple on Unraid.
+# DockerMan can still set network / port / volume mappings.
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    HERDR_PLUGIN_CONFIG_DIR=/config \
+    GATEWAY_LISTEN_HOST=0.0.0.0 \
+    GATEWAY_LISTEN_PORT=9876 \
+    GATEWAY_PUBLIC_HOST=192.168.100.3 \
+    HERDR_SOCKET=/herdr/herdr.sock
+
+EXPOSE 9876
+
+VOLUME ["/config"]
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["start"]

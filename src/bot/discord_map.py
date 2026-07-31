@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _CHANNEL_SAFE = re.compile(r"[^a-z0-9\-]+")
+_THREAD_UNSAFE = re.compile(r"[\r\n#@]+")
 
 
 def sanitize_channel_name(name: str, *, max_len: int = 90) -> str:
@@ -28,6 +29,15 @@ def sanitize_channel_name(name: str, *, max_len: int = 90) -> str:
     return slug[:max_len]
 
 
+def sanitize_thread_name(name: str, *, max_len: int = 90) -> str:
+    """Keep unicode / CJK for Discord thread titles; only strip control noise."""
+    text = _THREAD_UNSAFE.sub(" ", (name or "").strip())
+    text = re.sub(r"\s+", " ", text).strip(" -_|")
+    if not text:
+        text = "pane"
+    return text[:max_len]
+
+
 def remote_channel_name(prefix: str, remote_id: str, name: str | None = None) -> str:
     base = sanitize_channel_name(name or remote_id)
     prefix_slug = sanitize_channel_name(prefix.rstrip(":"), max_len=32)
@@ -37,10 +47,43 @@ def remote_channel_name(prefix: str, remote_id: str, name: str | None = None) ->
 
 
 def thread_name_for(pane: PaneInfo, bridge_cfg: BridgeConfig) -> str:
+    """Live Herdr fields only — no static lookup table.
+
+    Format: ``{emoji} {workspace} › {tab} · {name} [{pane_id}]``
+    Workspace/tab labels come from workspace.list / tab.list at sync time.
+    """
     emoji = bridge_cfg.status_emoji.get(pane.agent_status, "❓")
-    base = sanitize_channel_name(pane.label or pane.agent or pane.pane_id)
-    suffix = sanitize_channel_name(pane.pane_id.replace(":", "-"))[-8:]
-    return f"{emoji}-{base}-{suffix}"[:100]
+    workspace = sanitize_thread_name(pane.workspace_label or pane.workspace_id or "", max_len=28)
+    tab = sanitize_thread_name(pane.tab_label or "", max_len=20)
+    name = sanitize_thread_name(pane.agent or pane.label or "", max_len=32)
+    pane_id = (pane.pane_id or "").strip()
+
+    head_parts: list[str] = []
+    if workspace:
+        head_parts.append(workspace)
+    if tab and tab.lower() not in {p.lower() for p in head_parts}:
+        head_parts.append(tab)
+    if name and name.lower() not in {p.lower() for p in head_parts}:
+        head_parts.append(name)
+    if not head_parts:
+        head_parts.append(pane_id or "pane")
+
+    # workspace › tab · name  (tab is the "grouped" tab label)
+    if workspace and tab and name:
+        body = f"{workspace} › {tab} · {name}"
+    elif workspace and tab:
+        body = f"{workspace} › {tab}"
+    elif len(head_parts) >= 2:
+        body = " · ".join(head_parts)
+    else:
+        body = head_parts[0]
+
+    suffix = f" [{pane_id}]" if pane_id else ""
+    head = f"{emoji} {body}".strip()
+    budget = 100 - len(suffix)
+    if budget < 8:
+        return (pane_id or head)[:100]
+    return (head[:budget].rstrip(" ·›") + suffix)[:100]
 
 
 async def ensure_remote_channel(

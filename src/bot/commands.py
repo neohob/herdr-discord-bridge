@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any, TYPE_CHECKING
 
@@ -118,6 +119,35 @@ async def _ensure_client(bot: BridgeBot, remote_id: str) -> Any:
     return client if client is not None else await runtime.start_remote(remote)
 
 
+async def _workspace_labels(client: Any) -> dict[str, str]:
+    try:
+        result = await client.request("workspace.list")
+    except Exception:  # noqa: BLE001
+        return {}
+    labels: dict[str, str] = {}
+    for item in extract_list(result, "workspaces", "items"):
+        workspace_id = str(item.get("workspace_id") or item.get("id") or "")
+        label = str(item.get("label") or "").strip()
+        if workspace_id and label:
+            labels[workspace_id] = label
+    return labels
+
+
+async def _tab_labels(client: Any) -> dict[str, str]:
+    """Map tab_id → label from live ``tab.list`` (not a static table)."""
+    try:
+        result = await client.request("tab.list")
+    except Exception:  # noqa: BLE001
+        return {}
+    labels: dict[str, str] = {}
+    for item in extract_list(result, "tabs", "items"):
+        tab_id = str(item.get("tab_id") or item.get("id") or "")
+        label = str(item.get("label") or "").strip()
+        if tab_id and label:
+            labels[tab_id] = label
+    return labels
+
+
 async def _map_panes(
     *,
     interaction: discord.Interaction[Any],
@@ -127,11 +157,15 @@ async def _map_panes(
 ) -> int:
     channel = await _remote_channel(interaction, remote, bot.mapping)
     client = await _ensure_client(bot, remote.id)
+    workspace_labels = await _workspace_labels(client)
+    tab_labels = await _tab_labels(client)
     mapped = 0
     for pane_data in panes:
         pane = PaneInfo.from_dict(pane_data)
         if not pane.pane_id:
             continue
+        pane.workspace_label = workspace_labels.get(pane.workspace_id, pane.workspace_label)
+        pane.tab_label = tab_labels.get(pane.tab_id, pane.tab_label)
         await ensure_pane_thread(
             channel,
             pane,
@@ -141,6 +175,8 @@ async def _map_panes(
         )
         await client.observe_pane(pane.pane_id, True)
         mapped += 1
+        # Avoid Discord thread-create 429s that stretch past interaction timeouts.
+        await asyncio.sleep(1.0)
     return mapped
 
 
@@ -306,6 +342,9 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
         if remote is None:
             await _respond(interaction, "Run Sync in a Remote Channel.", ephemeral=True)
             return
+        # Sync can create many Threads and hit Discord 429s; defer before work.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         try:
             client = await _ensure_client(bot, remote.id)
             result = await client.request("pane.list")

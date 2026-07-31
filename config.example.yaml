@@ -31,6 +31,6 @@ bridge:
 # seed_remotes:
 #   - id: example-host
 #     host: 192.168.1.10
-#     port: 8787
+#     port: 9876
 #     token: "${GATEWAY_TOKEN}"
 #     fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

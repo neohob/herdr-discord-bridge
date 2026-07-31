@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>herdr-discord-gateway</Name>
+  <Repository>herdr-discord-gateway:local</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/neohob/herdr-discord-bridge</Support>
+  <Project>https://github.com/neohob/herdr-discord-bridge</Project>
+  <ReadMe/>
+  <Overview>TLS NDJSON Gateway for Herdr Discord Bridge (self-built local image).</Overview>
+  <Category>Tools:</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon>https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/discord.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="Host Port" Target="9876" Default="9876" Mode="tcp" Description="Gateway TLS listen port" Type="Port" Display="always" Required="true" Mask="false">9876</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/herdr-discord-gateway" Mode="rw" Description="Token + TLS certs" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/herdr-discord-gateway</Config>
+  <Config Name="Herdr Socket Dir" Target="/herdr" Default="/root/.config/herdr" Mode="rw" Description="Host directory containing herdr.sock" Type="Path" Display="always" Required="true" Mask="false">/root/.config/herdr</Config>
+  <Config Name="GATEWAY_PUBLIC_HOST" Target="GATEWAY_PUBLIC_HOST" Default="" Mode="" Description="IP for Discord /herdr register" Type="Variable" Display="always" Required="true" Mask="false">192.168.100.3</Config>
+  <Config Name="GATEWAY_LISTEN_PORT" Target="GATEWAY_LISTEN_PORT" Default="" Mode="" Description="Listen port inside container" Type="Variable" Display="advanced" Required="false" Mask="false">9876</Config>
+  <Config Name="HERDR_SOCKET" Target="HERDR_SOCKET" Default="" Mode="" Description="Path to herdr.sock inside container" Type="Variable" Display="advanced" Required="false" Mask="false">/herdr/herdr.sock</Config>
+  <Config Name="TZ" Target="TZ" Default="" Mode="" Description="Timezone" Type="Variable" Display="advanced" Required="false" Mask="false">Asia/Shanghai</Config>
+  <Config Name="HOST_OS" Target="HOST_OS" Default="" Mode="" Description="Host OS" Type="Variable" Display="advanced" Required="false" Mask="false">Unraid</Config>
+  <Config Name="HOST_HOSTNAME" Target="HOST_HOSTNAME" Default="" Mode="" Description="Host hostname" Type="Variable" Display="advanced" Required="false" Mask="false">Tower</Config>
+  <Config Name="HOST_CONTAINERNAME" Target="HOST_CONTAINERNAME" Default="" Mode="" Description="Container name" Type="Variable" Display="advanced" Required="false" Mask="false">herdr-discord-gateway</Config>
+  <TailscaleStateDir/>
+</Container>
