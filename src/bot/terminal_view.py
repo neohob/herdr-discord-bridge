@@ -133,6 +133,8 @@ def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
         return []
     if not base:
         return list(window)
+    if window == base:
+        return []
     if len(window) >= len(base) and window[: len(base)] == base:
         return list(window[len(base) :])
     # Scrolled: longest suffix(base) == prefix(window)
@@ -149,54 +151,73 @@ def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
     return list(window[idx + 1 :])
 
 
-def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
-    """Fold a Gateway sliding window into this turn's session_lines.
+def turn_lines_since_baseline(baseline: str | None, current: str) -> list[str]:
+    """Full chat-turn body for the latest pane snapshot (not an incremental append).
 
-    Returns how many lines were appended. Identical windows are no-ops.
+    Returns [] when nothing has changed since the user prompt — caller keeps 「思考中…」.
+    If the sliding window loses the baseline, still recover visible post-prompt output.
+    """
+    window = str(current or "").splitlines()
+    if not window:
+        return []
+    base = str(baseline or "").splitlines()
+    if not base:
+        return list(window)
+    if window == base:
+        return []
+
+    delta = _delta_from_baseline(base, window)
+    if delta:
+        return delta
+
+    # In-place edits / partial scroll: walk baseline from the end for an anchor.
+    for line in reversed(base):
+        if line == "":
+            continue
+        try:
+            idx = len(window) - 1 - window[::-1].index(line)
+        except ValueError:
+            continue
+        after = list(window[idx + 1 :])
+        if after:
+            return after
+        # Anchor is the last line but the line itself changed elsewhere — fall through.
+
+    # Screen cleared or baseline fully gone: the current window *is* the turn.
+    return list(window)
+
+
+def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
+    """Recompute this turn's session_lines from the latest Gateway window.
+
+    Returns 0 when the visible turn body is unchanged (keep 「思考中…」 / skip edit).
     """
     window = str(snapshot or "").splitlines()
-    if window == state.last_window:
-        return 0
-    prev = list(state.last_window)
+    turn = turn_lines_since_baseline(state.baseline_text, snapshot)
     state.last_window = list(window)
-
-    if state.baseline_text is not None and not state.session_lines:
-        base = state.baseline_text.splitlines()
-        added = _delta_from_baseline(base, window)
-        # Baseline scrolled completely off — fall back to delta vs previous push.
-        if not added and prev:
-            added = new_lines_from_window(prev, window)
-    elif state.session_lines:
-        added = new_lines_from_window(state.session_lines, window)
-        if not added and prev:
-            # Session tip scrolled out of the 50-line window; advance from prev.
-            added = new_lines_from_window(prev, window)
+    if turn == state.session_lines:
+        return 0
+    # Sealed Discord segments stay put; only replace the unsent tail when possible.
+    sealed = state.session_lines[: state.live_start]
+    if sealed and len(turn) >= len(sealed) and turn[: len(sealed)] == sealed:
+        state.session_lines = list(turn)
+    elif sealed:
+        # Prefix no longer matches (hard scroll) — restart live rendering on new body.
+        state.session_lines = list(turn)
+        state.live_start = 0
+        state.segment_index = 0
+        state.needs_new_message = True
+        state.message_id = None
     else:
-        added = new_lines_from_window(prev, window) if prev else list(window)
-
-    if added:
-        state.session_lines.extend(added)
-    return len(added)
+        state.session_lines = list(turn)
+    return 1
 
 
 def session_body(baseline: str | None, current: str, max_lines: int) -> str:
-    current_lines = current.splitlines()
-    if not current_lines:
+    lines = turn_lines_since_baseline(baseline, current)
+    if not lines:
         return ""
-    if baseline is None:
-        return "\n".join(current_lines[-max_lines:])
-    base_lines = baseline.splitlines()
-    if base_lines and current_lines[: len(base_lines)] == base_lines:
-        new_lines = current_lines[len(base_lines) :]
-        if not new_lines:
-            return ""
-        context = current_lines[max(0, len(base_lines) - 2) : len(base_lines)]
-        return "\n".join((context + new_lines)[-max_lines:])
-    # Sliding window after prompt: only the delta, not the whole tip.
-    delta = _delta_from_baseline(base_lines, current_lines)
-    if delta:
-        return "\n".join(delta[-max_lines:])
-    return ""
+    return "\n".join(lines[-max_lines:])
 
 
 def render_chat_reply(
@@ -295,7 +316,8 @@ async def begin_prompt_session(
     state.session_lines = []
     state.live_start = 0
     state.segment_index = 0
-    state.last_window = []
+    # Seed so the first post-prompt push can diff against the pre-prompt tip.
+    state.last_window = str(state.text or "").splitlines()
     state.last_rendered = PLACEHOLDER
     state.active = True
     state.status = "working"
@@ -386,9 +408,12 @@ async def apply_terminal_view(
     if message_id is not None and not state.needs_new_message and state.message_id is None:
         state.message_id = message_id
 
-    added = absorb_gateway_window(state, text)
+    changed = absorb_gateway_window(state, text)
     # Nothing new since the prompt — keep 「思考中…」, do not edit to "…".
-    if added == 0 and not force:
+    if not changed and not force:
+        return state.message_id
+    # Still only the placeholder state (empty turn body).
+    if not state.session_lines and not force:
         return state.message_id
 
     now = clock()

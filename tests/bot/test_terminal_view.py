@@ -187,11 +187,10 @@ async def test_sliding_window_still_streams_new_lines():
 
     await begin_prompt_session(thread, "p1", prompt, remote_id="r")
     state = get_terminal_state(thread, "p1")
-    # 50-line-style window: baseline tip then scroll introducing agent output.
     base = [f"L{i}" for i in range(10)]
     state.baseline_text = "\n".join(base)
     state.session_lines = []
-    state.last_window = []
+    state.last_window = list(base)
 
     await apply_terminal_view(
         thread, "p1", "\n".join(base), "working", cfg, clock=clock.now
@@ -205,3 +204,44 @@ async def test_sliding_window_still_streams_new_lines():
     reply.edit.assert_awaited()
     assert "agent says hi" in _text(reply.edit.await_args)
     assert "思考中" not in _text(reply.edit.await_args)
+
+
+@pytest.mark.asyncio
+async def test_lost_baseline_still_shows_window():
+    """If pane.read scrolls the prompt baseline away, still update past 思考中."""
+    clock = FakeClock(1000.0)
+    thread = AsyncMock()
+    thread.id = 7
+    reply = MagicMock(id=12, edit=AsyncMock())
+    prompt = MagicMock(id=5)
+    prompt.reply = AsyncMock(return_value=reply)
+    thread.fetch_message = AsyncMock(return_value=reply)
+    cfg = _bridge(edit_cooldown=0.0)
+
+    await begin_prompt_session(thread, "p1", prompt, remote_id="r")
+    state = get_terminal_state(thread, "p1")
+    state.baseline_text = "old-a\nold-b\nold-c"
+    state.last_window = state.baseline_text.splitlines()
+    state.session_lines = []
+
+    # Completely different window (baseline scrolled/cleared off).
+    await apply_terminal_view(
+        thread,
+        "p1",
+        "agent line 1\nagent line 2",
+        "working",
+        cfg,
+        clock=clock.now,
+    )
+    reply.edit.assert_awaited()
+    body = _text(reply.edit.await_args)
+    assert "agent line 2" in body
+    assert "思考中" not in body
+
+
+def test_turn_lines_unchanged_is_empty():
+    from src.bot.terminal_view import turn_lines_since_baseline
+
+    assert turn_lines_since_baseline("a\nb", "a\nb") == []
+    assert turn_lines_since_baseline("a\nb", "a\nb\nc") == ["c"]
+    assert turn_lines_since_baseline("a\nb", "x\ny") == ["x", "y"]
