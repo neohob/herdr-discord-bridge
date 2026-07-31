@@ -1,4 +1,7 @@
-"""Create/update Discord categories and pane channels for remotes."""
+"""Create/update Discord categories and pane channels for remotes.
+
+Legacy Category/Channel model — TODO(Task 10): migrate bot.py to src.bot.discord_map.
+"""
 
 from __future__ import annotations
 

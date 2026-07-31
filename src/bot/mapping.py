@@ -1,4 +1,4 @@
-"""Legacy Category/Channel mapping for pre-Task-10 bot — use src.bot.mapping for ADR-0009."""
+"""Persist Discord Remote Channel / Pane Thread mapping."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any
 class PaneMapping:
     remote_id: str
     pane_id: str
-    channel_id: int
+    thread_id: int
     terminal_message_id: int | None = None
     label: str = ""
     agent_status: str = "unknown"
@@ -22,7 +22,7 @@ class PaneMapping:
 @dataclass
 class RemoteMapping:
     remote_id: str
-    category_id: int | None = None
+    channel_id: int | None = None
     panes: dict[str, PaneMapping] = field(default_factory=dict)
 
 
@@ -43,15 +43,15 @@ class MappingStore:
             for rid, data in (raw.get("remotes") or {}).items():
                 panes: dict[str, PaneMapping] = {}
                 for pid, pdata in (data.get("panes") or {}).items():
-                    channel_id = pdata.get("channel_id")
-                    if channel_id is None and pdata.get("thread_id") is not None:
-                        channel_id = pdata["thread_id"]
-                    if channel_id is None:
+                    thread_id = pdata.get("thread_id")
+                    if thread_id is None and pdata.get("channel_id") is not None:
+                        thread_id = pdata["channel_id"]
+                    if thread_id is None:
                         continue
                     panes[pid] = PaneMapping(
                         remote_id=rid,
                         pane_id=pid,
-                        channel_id=int(channel_id),
+                        thread_id=int(thread_id),
                         terminal_message_id=(
                             int(pdata["terminal_message_id"])
                             if pdata.get("terminal_message_id") is not None
@@ -60,12 +60,12 @@ class MappingStore:
                         label=str(pdata.get("label") or ""),
                         agent_status=str(pdata.get("agent_status") or "unknown"),
                     )
-                category_id = data.get("category_id")
-                if category_id is None and data.get("channel_id") is not None:
-                    category_id = data["channel_id"]
+                channel_id = data.get("channel_id")
+                if channel_id is None and data.get("category_id") is not None:
+                    channel_id = data["category_id"]
                 remotes[rid] = RemoteMapping(
                     remote_id=rid,
-                    category_id=int(category_id) if category_id else None,
+                    channel_id=int(channel_id) if channel_id else None,
                     panes=panes,
                 )
             self.remotes = remotes
@@ -75,12 +75,12 @@ class MappingStore:
             payload: dict[str, Any] = {"remotes": {}}
             for rid, rm in self.remotes.items():
                 payload["remotes"][rid] = {
-                    "category_id": rm.category_id,
+                    "channel_id": rm.channel_id,
                     "panes": {pid: asdict(pm) for pid, pm in rm.panes.items()},
                 }
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
             tmp.replace(self.path)
 
     def ensure_remote(self, remote_id: str) -> RemoteMapping:
@@ -89,16 +89,24 @@ class MappingStore:
                 self.remotes[remote_id] = RemoteMapping(remote_id=remote_id)
             return self.remotes[remote_id]
 
-    def set_category(self, remote_id: str, category_id: int) -> None:
+    def set_remote_channel(self, remote_id: str, channel_id: int) -> None:
         with self._lock:
             rm = self.ensure_remote(remote_id)
-            rm.category_id = category_id
+            rm.channel_id = channel_id
             self.save()
 
     def upsert_pane(self, mapping: PaneMapping) -> None:
         with self._lock:
             rm = self.ensure_remote(mapping.remote_id)
             rm.panes[mapping.pane_id] = mapping
+            self.save()
+
+    def set_terminal_message(self, remote_id: str, pane_id: str, message_id: int) -> None:
+        with self._lock:
+            pm = self.get_pane(remote_id, pane_id)
+            if pm is None:
+                return
+            pm.terminal_message_id = message_id
             self.save()
 
     def remove_pane(self, remote_id: str, pane_id: str) -> None:
@@ -115,10 +123,10 @@ class MappingStore:
             return None
         return rm.panes.get(pane_id)
 
-    def find_by_channel(self, channel_id: int) -> PaneMapping | None:
+    def find_by_thread(self, thread_id: int) -> PaneMapping | None:
         for rm in self.remotes.values():
             for pm in rm.panes.values():
-                if pm.channel_id == channel_id:
+                if pm.thread_id == thread_id:
                     return pm
         return None
 

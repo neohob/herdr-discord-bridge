@@ -1,4 +1,7 @@
-"""Edit a Discord message to simulate a live terminal pane."""
+"""Edit a Discord message to simulate a live terminal pane.
+
+Legacy text-channel model — TODO(Task 10): use src.bot.terminal_view in Pane Threads.
+"""
 
 from __future__ import annotations
 
