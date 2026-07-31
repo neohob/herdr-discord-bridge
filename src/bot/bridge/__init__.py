@@ -1,0 +1,1 @@
+"""Discord ↔ Herdr bridging modules."""

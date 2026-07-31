@@ -1,0 +1,30 @@
+discord:
+  token: "${DISCORD_TOKEN}"
+  guild_id: 0          # replace with your Discord server ID
+  home_channel_id: 0   # optional: channel for ready / reconnect alerts
+
+bridge:
+  category_prefix: "remote:"
+  terminal:
+    max_lines: 50
+    edit_cooldown: 2.0
+    poll_interval: 2.0
+  status_emoji:
+    idle: "🟢"
+    working: "🔵"
+    blocked: "🔴"
+    done: "✅"
+    shell: "⚪"
+    unknown: "❓"
+  sync_interval: 300
+  read_only: false
+
+# Paste snippets from scripts/setup-remote-ssh.sh on each Herdr host.
+# In Docker Compose, put private keys under ./keys and use /app/keys/... below.
+remotes:
+  - id: example-host
+    host: 192.168.1.10
+    port: 22
+    user: neo
+    ssh_key: /app/keys/id_ed25519_discord_bridge_example-host
+    herdr_socket: ~/.config/herdr/herdr.sock

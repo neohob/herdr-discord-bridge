@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+logs/*.log
+cache/mapping.json
+*.md
+.cursor/
+agent-transcripts/

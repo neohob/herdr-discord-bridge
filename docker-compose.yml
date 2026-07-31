@@ -1,0 +1,34 @@
+services:
+  herdr-discord-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: herdr-discord-bridge
+    restart: unless-stopped
+
+    volumes:
+      # Bot config (discord token may also come from env)
+      - ./config.yaml:/app/config.yaml:ro
+
+      # SSH private keys for remotes (paths in config.yaml should point under /app/keys/)
+      - ./keys:/app/keys:ro
+
+      # Discord ↔ Herdr mapping persistence
+      - ./cache:/app/cache
+
+      # Logs
+      - ./logs:/app/logs
+
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - BRIDGE_CONFIG=/app/config.yaml
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+
+    # Outbound only: Discord API + SSH to remotes
+    network_mode: bridge
+
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
