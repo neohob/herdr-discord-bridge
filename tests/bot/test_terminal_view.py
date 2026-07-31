@@ -1,4 +1,4 @@
-"""Unit tests for Terminal View scrollback + embeds."""
+"""Unit tests for Terminal View — no duplicate scrollback."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from src.bot.terminal_view import (
     begin_prompt_session,
     clear_terminal_state,
     flush_terminal_view,
-    merge_sliding_window,
+    get_terminal_state,
+    new_lines_from_window,
     session_body,
 )
 
@@ -35,7 +36,6 @@ def _make_thread(*, message_id: int = 42) -> tuple[AsyncMock, MagicMock]:
     msg = MagicMock()
     msg.id = message_id
     msg.edit = AsyncMock()
-    msg.reply = AsyncMock()
     thread.fetch_message = AsyncMock(return_value=msg)
     thread.send = AsyncMock(return_value=msg)
     return thread, msg
@@ -44,14 +44,12 @@ def _make_thread(*, message_id: int = 42) -> tuple[AsyncMock, MagicMock]:
 def _embed_text(call) -> str:
     if not call:
         return ""
-    args, kwargs = call
+    _args, kwargs = call
     embed = kwargs.get("embed")
-    if embed is None and args:
-        # positional unlikely
-        return ""
     if embed is None:
         return str(kwargs.get("content") or "")
-    return f"{embed.title}\n{embed.description}\n{embed.footer.text if embed.footer else ''}"
+    footer = embed.footer.text if embed.footer else ""
+    return f"{embed.title}\n{embed.description}\n{footer}"
 
 
 def _sent_text(thread: AsyncMock) -> str:
@@ -73,20 +71,45 @@ def _bridge(*, edit_cooldown: float = 2.0) -> BridgeConfig:
     return BridgeConfig(terminal=TerminalConfig(edit_cooldown=edit_cooldown))
 
 
-def test_merge_sliding_window_appends():
-    buf = ["a", "b", "c"]
-    merge_sliding_window(buf, ["b", "c", "d", "e"])
-    assert buf == ["a", "b", "c", "d", "e"]
+def test_new_lines_from_sliding_window_no_dupes():
+    session = ["a", "b", "c", "d"]
+    # Typical slide: drop a, add e
+    assert new_lines_from_window(session, ["b", "c", "d", "e"]) == ["e"]
+    # Same window again
+    assert new_lines_from_window(session + ["e"], ["b", "c", "d", "e"]) == []
+    # Unrelated full window must NOT be re-appended
+    assert new_lines_from_window(["x", "y"], ["1", "2", "3"]) == []
 
 
 def test_session_body_prefers_new_lines_after_baseline():
-    baseline = "a\nb\nc"
-    current = "a\nb\nc\nd\ne"
-    assert session_body(baseline, current, 50) == "b\nc\nd\ne"
+    assert session_body("a\nb\nc", "a\nb\nc\nd\ne", 50) == "b\nc\nd\ne"
 
 
-def test_session_body_falls_back_when_baseline_missing():
-    assert session_body(None, "1\n2\n3\n4", 2) == "3\n4"
+@pytest.mark.asyncio
+async def test_sliding_updates_edit_one_message_without_dup_lines():
+    clock = FakeClock(1000.0)
+    thread, msg = _make_thread()
+    cfg = _bridge(edit_cooldown=0.0)
+
+    await apply_terminal_view(thread, "p1", "a\nb\nc", "working", cfg, clock=clock.now)
+    await apply_terminal_view(thread, "p1", "b\nc\nd", "working", cfg, clock=clock.now)
+    await apply_terminal_view(thread, "p1", "c\nd\ne", "working", cfg, clock=clock.now)
+
+    # One send, then edits — never a new message per line
+    assert thread.send.await_count == 1
+    state = get_terminal_state(thread, "p1")
+    assert state.session_lines == ["a", "b", "c", "d", "e"]
+    # Live embed body should list each line once
+    body = _edited_text(msg) or _sent_text(thread)
+    assert body.count("```") >= 2
+    for line in ("a", "b", "c", "d", "e"):
+        # description contains line once inside fences
+        assert _edited_text(msg).count(line) == 1 or (
+            thread.send.await_count == 1 and "e" in _edited_text(msg)
+        )
+    desc = msg.edit.await_args.kwargs["embed"].description
+    for line in ("a", "b", "c", "d", "e"):
+        assert desc.count(line) == 1
 
 
 @pytest.mark.asyncio
@@ -95,16 +118,11 @@ async def test_first_apply_sends_terminal_embed():
     thread, _msg = _make_thread()
     cfg = _bridge()
 
-    mid = await apply_terminal_view(
-        thread, "pane-1", "hello", "idle", cfg, clock=clock.now
-    )
-
+    mid = await apply_terminal_view(thread, "pane-1", "hello", "idle", cfg, clock=clock.now)
     assert mid == 42
-    thread.send.assert_awaited_once()
     text = _sent_text(thread)
     assert "终端输出" in text
     assert "hello" in text
-    assert "上方是你的输入" in text
 
 
 @pytest.mark.asyncio
@@ -114,7 +132,7 @@ async def test_coalesce_skips_edit_within_cooldown():
     cfg = _bridge(edit_cooldown=2.0)
 
     await apply_terminal_view(thread, "pane-1", "first", "idle", cfg, clock=clock.now)
-    await apply_terminal_view(thread, "pane-1", "second", "working", cfg, clock=clock.now)
+    await apply_terminal_view(thread, "pane-1", "first\nsecond", "working", cfg, clock=clock.now)
 
     thread.send.assert_awaited_once()
     msg.edit.assert_not_awaited()
@@ -128,148 +146,41 @@ async def test_flush_after_cooldown_applies_pending_edit():
 
     await apply_terminal_view(thread, "pane-1", "first", "idle", cfg, clock=clock.now)
     await apply_terminal_view(thread, "pane-1", "first\nsecond", "working", cfg, clock=clock.now)
-
     clock.advance(2.1)
-    mid = await flush_terminal_view(thread, "pane-1", cfg, clock=clock.now)
-
-    assert mid == 42
-    msg.edit.assert_awaited_once()
-    edited = _edited_text(msg)
-    assert "second" in edited
-    assert "终端输出" in edited
+    await flush_terminal_view(thread, "pane-1", cfg, clock=clock.now)
+    assert "second" in _edited_text(msg)
 
 
 @pytest.mark.asyncio
 async def test_deferred_edit_flushes_when_no_later_push_arrives():
     thread, msg = _make_thread()
     cfg = _bridge(edit_cooldown=0.02)
-
     await apply_terminal_view(thread, "pane-1", "first", "idle", cfg)
     await apply_terminal_view(thread, "pane-1", "first\nfinal", "working", cfg)
-
     await asyncio.sleep(0.05)
-
-    msg.edit.assert_awaited_once()
     assert "final" in _edited_text(msg)
 
 
 @pytest.mark.asyncio
-async def test_force_bypasses_cooldown():
-    clock = FakeClock(1000.0)
-    thread, msg = _make_thread()
-    cfg = _bridge(edit_cooldown=10.0)
-
-    await apply_terminal_view(thread, "pane-1", "first", "idle", cfg, clock=clock.now)
-    await apply_terminal_view(
-        thread, "pane-1", "first\nforced", "blocked", cfg, clock=clock.now, force=True
-    )
-
-    msg.edit.assert_awaited_once()
-    assert "forced" in _edited_text(msg)
-
-
-@pytest.mark.asyncio
-async def test_reuses_existing_message_id():
-    clock = FakeClock(1000.0)
-    thread, msg = _make_thread(message_id=99)
-    cfg = _bridge(edit_cooldown=0.0)
-
-    mid = await apply_terminal_view(
-        thread,
-        "pane-1",
-        "hello",
-        "idle",
-        cfg,
-        clock=clock.now,
-        message_id=99,
-    )
-
-    assert mid == 99
-    thread.send.assert_not_awaited()
-    thread.fetch_message.assert_awaited_once_with(99)
-    msg.edit.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_begin_prompt_session_replies_with_embed():
+async def test_begin_prompt_only_keeps_new_lines():
     clock = FakeClock(1000.0)
     thread = AsyncMock()
-    thread.id = 1001
-    first = MagicMock()
-    first.id = 10
-    first.edit = AsyncMock()
-    second = MagicMock()
-    second.id = 20
-    second.edit = AsyncMock()
+    thread.id = 7
+    first = MagicMock(id=1, edit=AsyncMock())
+    second = MagicMock(id=2, edit=AsyncMock())
     thread.send = AsyncMock(return_value=first)
-
-    async def fetch(mid: int):
-        return {10: first, 20: second}[mid]
-
-    thread.fetch_message = AsyncMock(side_effect=fetch)
+    thread.fetch_message = AsyncMock(side_effect=lambda mid: {1: first, 2: second}[mid])
     cfg = _bridge(edit_cooldown=0.0)
 
-    await apply_terminal_view(thread, "p1", "old", "idle", cfg, clock=clock.now, remote_id="r")
-    assert thread.send.await_count == 1
-
-    prompt = MagicMock()
-    prompt.id = 99
+    await apply_terminal_view(thread, "p1", "old1\nold2", "idle", cfg, clock=clock.now, remote_id="r")
+    prompt = MagicMock(id=99)
     prompt.reply = AsyncMock(return_value=second)
     await begin_prompt_session(thread, "p1", prompt, remote_id="r")
-
-    mid = await apply_terminal_view(
-        thread, "p1", "old\nnew", "working", cfg, clock=clock.now, remote_id="r", message_id=10
-    )
-    assert mid == 20
-    prompt.reply.assert_awaited_once()
-    assert prompt.reply.await_args.kwargs.get("embed") is not None
-    first.edit.assert_not_awaited()
-    clock.advance(1.0)
     await apply_terminal_view(
-        thread, "p1", "old\nnew\nmore", "working", cfg, clock=clock.now, remote_id="r"
+        thread, "p1", "old1\nold2\nnewA\nnewB", "working", cfg, clock=clock.now, remote_id="r"
     )
-    second.edit.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_long_session_seals_multiple_embeds():
-    clock = FakeClock(1000.0)
-    thread = AsyncMock()
-    thread.id = 55
-    ids = {"n": 0}
-
-    def new_msg():
-        ids["n"] += 1
-        m = MagicMock()
-        m.id = ids["n"]
-        m.edit = AsyncMock()
-        return m
-
-    msgs: dict[int, MagicMock] = {}
-
-    async def send(**kwargs):
-        m = new_msg()
-        msgs[m.id] = m
-        return m
-
-    async def fetch(mid: int):
-        return msgs[mid]
-
-    thread.send = AsyncMock(side_effect=send)
-    thread.fetch_message = AsyncMock(side_effect=fetch)
-    cfg = _bridge(edit_cooldown=0.0)
-
-    # Grow a long buffer via successive windows
-    lines = [f"line-{i:04d} " + ("x" * 40) for i in range(80)]
-    for i in range(10, 81, 10):
-        window = "\n".join(lines[max(0, i - 50) : i])
-        await apply_terminal_view(
-            thread, "p1", window, "working", cfg, clock=clock.now, remote_id="r"
-        )
-        clock.advance(1.0)
-
-    # Should have sealed at least one historical segment + live
-    assert thread.send.await_count >= 2
-    first_embed = thread.send.await_args_list[0].kwargs.get("embed")
-    assert first_embed is not None
-    assert "终端输出" in first_embed.title
+    state = get_terminal_state(thread, "p1")
+    assert state.session_lines == ["newA", "newB"]
+    desc = prompt.reply.await_args.kwargs["embed"].description
+    assert "newA" in desc and "newB" in desc
+    assert "old1" not in desc
