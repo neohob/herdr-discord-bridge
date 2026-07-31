@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 import discord
 
+from src.bot.choice_ui import blocked_view
 from src.bot.config import AppConfig
 from src.bot.discord_map import thread_name_for
 from src.bot.gateway_client import GatewayClient
@@ -186,8 +187,14 @@ class Runtime:
                 log.exception("failed renaming pane thread %s:%s", remote_id, pane_id)
 
         if status == "blocked":
-            # Task 12 will replace this with the choice UI.
-            await self._notify_thread(thread, f"🔴 `{remote_id}:{pane_id}` is blocked.")
+            if thread is not None:
+                try:
+                    await thread.send(
+                        f"🔴 `{remote_id}:{pane_id}` is blocked. Choose a response:",
+                        view=blocked_view(remote_id, pane_id),
+                    )
+                except discord.HTTPException:
+                    log.exception("failed sending blocked choice UI")
 
     async def _notify_lifecycle(
         self,

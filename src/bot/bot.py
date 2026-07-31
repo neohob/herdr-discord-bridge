@@ -10,9 +10,15 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+from src.bot.chat_input import on_message as forward_chat_input
 from src.bot.commands import register_commands
 from src.bot.config import AppConfig, load_config
 from src.bot.gateway_client import GatewayClient
+from src.bot.lifecycle import (
+    on_guild_channel_delete as handle_channel_delete,
+    on_raw_thread_delete as handle_raw_thread_delete,
+    on_thread_delete as handle_thread_delete,
+)
 from src.bot.mapping import MappingStore
 from src.bot.registry import RemoteRegistry
 from src.bot.runtime import Runtime
@@ -24,18 +30,34 @@ class BridgeBot(commands.Bot):
     def __init__(self, config: AppConfig):
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.message_content = False
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.mapping = MappingStore(config.mapping_path)
         self.registry = RemoteRegistry(config.registry_path)
         self.runtime: Runtime | None = None
+        self.add_listener(self._forward_chat_input, "on_message")
+        self.add_listener(self._handle_channel_delete, "on_guild_channel_delete")
+        self.add_listener(self._handle_thread_delete, "on_thread_delete")
+        self.add_listener(self._handle_raw_thread_delete, "on_raw_thread_delete")
 
     def require_client(self, remote_id: str) -> GatewayClient:
         client = self.runtime.clients.get(remote_id) if self.runtime else None
         if client is None:
             raise RuntimeError(f"remote `{remote_id}` is not connected")
         return client
+
+    async def _forward_chat_input(self, message: discord.Message) -> None:
+        await forward_chat_input(self, message)
+
+    async def _handle_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        await handle_channel_delete(self, channel)
+
+    async def _handle_thread_delete(self, thread: discord.Thread) -> None:
+        await handle_thread_delete(self, thread)
+
+    async def _handle_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        await handle_raw_thread_delete(self, payload)
 
     async def setup_hook(self) -> None:
         register_commands(self.tree, self)

@@ -119,6 +119,13 @@ class GatewayClient:
             {"pane_id": pane_id, "enable": enable},
         )
 
+    async def send_input(self, pane_id: str, text: str, *, keys: list[str]) -> Any:
+        """Send text and key presses to a Herdr Pane through the control RPC."""
+        return await self.request(
+            "pane.send_input",
+            {"pane_id": pane_id, "text": text, "keys": keys},
+        )
+
     def _mark_control_lost(self) -> None:
         self._control_ready.clear()
         self._control_lost.set()
