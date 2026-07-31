@@ -10,10 +10,7 @@ services:
       # Bot config (discord token may also come from env)
       - ./config.yaml:/app/config.yaml:ro
 
-      # SSH private keys for remotes (paths in config.yaml should point under /app/keys/)
-      - ./keys:/app/keys:ro
-
-      # Discord ↔ Herdr mapping persistence
+      # Remote registry + Discord ↔ Herdr mapping persistence
       - ./cache:/app/cache
 
       # Logs
@@ -24,7 +21,7 @@ services:
       - BRIDGE_CONFIG=/app/config.yaml
       - LOG_LEVEL=${LOG_LEVEL:-info}
 
-    # Outbound only: Discord API + SSH to remotes
+    # Outbound only: Discord API + TLS to remote Gateways
     network_mode: bridge
 
     deploy:

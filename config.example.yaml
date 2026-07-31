@@ -1,3 +1,6 @@
+# Copy to config.yaml and set guild_id / operators before `docker compose up`.
+# Remotes are normally registered via /herdr in Discord (host, port, token, TLS fingerprint).
+
 discord:
   token: "${DISCORD_TOKEN}"
   guild_id: 0          # replace with your Discord server ID
