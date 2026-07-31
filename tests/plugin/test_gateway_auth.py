@@ -214,6 +214,78 @@ async def test_push_session_registers_in_hub(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_observe_pane_with_push_pump(tmp_path):
+    from plugin.test_push_pump import EventCollectingHub, FakeHerdrClient, FakeHerdrSubscriber
+    from src.plugin.gateway.push_pump import PushPump
+
+    cert_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+    expected_fp = generate_self_signed(cert_path, key_path)
+
+    port = _free_port()
+    cfg = GatewayConfig(
+        listen_host="127.0.0.1",
+        listen_port=port,
+        token="observe-token",
+        herdr_socket="/tmp/unused.sock",
+        cert_path=cert_path,
+        key_path=key_path,
+    )
+
+    hub = EventCollectingHub()
+    fake_herdr = FakeHerdrClient()
+    fake_herdr.set_reads(
+        "w1:p1",
+        [{"text": "hello", "revision": 1, "truncated": False}],
+    )
+    fake_subscriber = FakeHerdrSubscriber(events=[])
+    pump = PushPump(
+        hub,
+        cfg.herdr_socket,
+        herdr_factory=lambda: fake_herdr,
+        subscriber_factory=lambda: fake_subscriber,
+        push_cooldown=0.05,
+        poll_interval=0.02,
+    )
+
+    gateway_task = asyncio.create_task(
+        serve_gateway(cfg, lambda: fake_herdr, push_hub=hub, push_pump=pump),
+    )
+    pump_task = asyncio.create_task(pump.run())
+    await asyncio.sleep(0.05)
+
+    try:
+        reader, writer = await _tls_connect(port, expected_fp)
+        await _auth_control(reader, writer, "observe-token")
+
+        writer.write(
+            encode_line(
+                make_request("bridge.observe_pane", {"pane_id": "w1:p1", "enable": True}),
+            ),
+        )
+        await writer.drain()
+        line = await reader.readline()
+        resp = decode_line(line)
+        assert unwrap_result(resp) == {"type": "ok"}
+
+        ev = await hub.wait_event("bridge.terminal_output", timeout=2)
+        assert ev["data"]["pane_id"] == "w1:p1"
+        assert ev["data"]["text"] == "hello"
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        gateway_task.cancel()
+        pump_task.cancel()
+        for task in (gateway_task, pump_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await pump.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_bridge_method_returns_not_implemented(tmp_path, unix_sock_path):
     cert_path = tmp_path / "cert.pem"
     key_path = tmp_path / "key.pem"

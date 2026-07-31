@@ -60,10 +60,21 @@ async def _send_and_close(writer: asyncio.StreamWriter, payload: dict[str, Any])
         pass
 
 
-def _handle_bridge_method(method: str, params: dict[str, Any], req_id: Any) -> dict[str, Any]:
+async def _handle_bridge_method(
+    method: str,
+    params: dict[str, Any],
+    req_id: Any,
+    push_pump: Any | None,
+) -> dict[str, Any]:
     if method == "bridge.observe_pane":
-        # Task 5 will implement observe; keep explicit hook here.
-        return _error_response(req_id, "not_implemented", "bridge.observe_pane not yet implemented")
+        if push_pump is None:
+            return _error_response(req_id, "not_implemented", "bridge.observe_pane not yet implemented")
+        pane_id = params.get("pane_id")
+        if not pane_id:
+            return _error_response(req_id, "invalid_params", "pane_id is required")
+        enable = bool(params.get("enable"))
+        await push_pump.set_observe(str(pane_id), enable)
+        return {"id": req_id, "result": {"type": "ok"}}
     return _error_response(req_id, "not_implemented", f"bridge method {method!r} not implemented")
 
 
@@ -71,6 +82,7 @@ async def _handle_control_session(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     herdr_factory: Callable[[], Any],
+    push_pump: Any | None = None,
 ) -> None:
     while True:
         line = await reader.readline()
@@ -88,7 +100,7 @@ async def _handle_control_session(
         params = req.get("params") or {}
 
         if method.startswith("bridge."):
-            resp = _handle_bridge_method(method, params, req_id)
+            resp = await _handle_bridge_method(method, params, req_id, push_pump)
         else:
             herdr = herdr_factory()
             try:
@@ -132,6 +144,7 @@ async def _handle_client(
     cfg: GatewayConfig,
     herdr_factory: Callable[[], Any],
     push_hub: PushHub,
+    push_pump: Any | None = None,
 ) -> None:
     try:
         line = await reader.readline()
@@ -170,7 +183,7 @@ async def _handle_client(
         if role == "push":
             await _handle_push_session(reader, writer, push_hub)
         else:
-            await _handle_control_session(reader, writer, herdr_factory)
+            await _handle_control_session(reader, writer, herdr_factory, push_pump)
     finally:
         if not writer.is_closing():
             writer.close()
@@ -185,6 +198,7 @@ async def serve_gateway(
     herdr_factory: Callable[[], Any],
     *,
     push_hub: PushHub | None = None,
+    push_pump: Any | None = None,
 ) -> None:
     """Run the TLS gateway until cancelled."""
     hub = push_hub or PushHub()
@@ -194,7 +208,7 @@ async def serve_gateway(
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        await _handle_client(reader, writer, cfg, herdr_factory, hub)
+        await _handle_client(reader, writer, cfg, herdr_factory, hub, push_pump)
 
     server = await asyncio.start_server(
         client_handler,
