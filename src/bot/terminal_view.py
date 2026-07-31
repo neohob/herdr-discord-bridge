@@ -1,11 +1,11 @@
-"""Terminal View: one live Embed per turn, no duplicated scrollback.
+"""Terminal View: plain-text continuation from the last message's end.
 
-Design:
-- User chat = plain messages.
-- Bot output = Embed titled 「终端输出」 (blue while live, grey when sealed).
-- Gateway sends a sliding window; we only **append lines that are truly new**.
-- We **edit one live Embed** in place. When it is full, we seal it once and
-  start a new live Embed with **only the remainder** (no re-print of sealed text).
+Rules:
+- No Embeds, no code fences — plain Discord text (readable).
+- Previously posted messages are never edited again.
+- Only **new** lines (after the last posted line) go into the current live
+  message; when it fills, we leave it alone and start a new message for the
+  remainder.
 """
 
 from __future__ import annotations
@@ -24,11 +24,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-EMBED_BODY_LIMIT = 3200
-SEGMENT_MAX_LINES = 40
-COLOR_LIVE = 0x2563EB
-COLOR_SEALED = 0x64748B
-COLOR_BLOCKED = 0xDC2626
+# Discord content limit 2000; keep headroom for the header line.
+MSG_BODY_LIMIT = 1700
+SEGMENT_MAX_LINES = 35
 
 
 @dataclass
@@ -44,9 +42,11 @@ class _TerminalState:
     anchor_message: Any | None = None
     anchor_message_id: int | None = None
     baseline_text: str | None = None
-    # Deduped scrollback for this prompt turn only
     session_lines: list[str] = field(default_factory=list)
-    sealed_line_count: int = 0
+    # Lines already committed into Discord (sealed + current live buffer posted).
+    posted_line_count: int = 0
+    # Start offset of the current live message within session_lines.
+    live_start: int = 0
     segment_index: int = 0
     last_window: list[str] = field(default_factory=list)
     choice_message_id: int | None = None
@@ -93,50 +93,30 @@ def clear_terminal_state(thread_id: int | None = None, pane_id: str | None = Non
 
 
 def new_lines_from_window(session: list[str], window: list[str]) -> list[str]:
-    """Return only lines in *window* that are not already covered by *session*.
-
-    Never re-appends an overlapping sliding window. If nothing new, returns [].
-    """
+    """Only lines in *window* not already covered by *session*."""
     if not window:
         return []
     if not session:
         return list(window)
-
-    # Identical to current suffix → no change.
     if len(window) <= len(session) and session[-len(window) :] == window:
         return []
-
-    # Window extends session: session suffix == window prefix.
     max_n = min(len(session), len(window))
     for n in range(max_n, 0, -1):
         if session[-n:] == window[:n]:
             return list(window[n:])
-
-    # Window replaces a trailing region of session (same start, refreshed tail).
     for start in range(max(0, len(session) - len(window)), len(session)):
         chunk = session[start:]
-        if not chunk:
-            break
-        if window[: len(chunk)] == chunk:
-            # Net-new lines after the overlapping head.
+        if chunk and window[: len(chunk)] == chunk:
             return list(window[len(chunk) :])
-
-    # Last matching line heuristic (avoid full-window re-append).
     last = session[-1]
     try:
         idx = len(window) - 1 - window[::-1].index(last)
     except ValueError:
-        idx = -1
-    if idx >= 0:
-        return list(window[idx + 1 :])
-
-    # Discontinuous jump: do **not** dump the whole window (that caused dup spam).
-    log.debug("terminal window did not align; skipping %d lines to avoid dupes", len(window))
-    return []
+        return []
+    return list(window[idx + 1 :])
 
 
 def absorb_gateway_window(state: _TerminalState, snapshot: str) -> int:
-    """Append only new lines into session_lines. Returns number added."""
     window = str(snapshot or "").splitlines()
     if window == state.last_window:
         return 0
@@ -159,7 +139,6 @@ def absorb_gateway_window(state: _TerminalState, snapshot: str) -> int:
 
 
 def session_body(baseline: str | None, current: str, max_lines: int) -> str:
-    """Kept for older tests; prefer absorb_gateway_window in production."""
     current_lines = current.splitlines()
     if not current_lines:
         return ""
@@ -175,13 +154,7 @@ def session_body(baseline: str | None, current: str, max_lines: int) -> str:
     return "\n".join(current_lines[-max_lines:])
 
 
-def _status_color(status: str, *, live: bool) -> int:
-    if str(status).lower() in {"blocked", "waiting", "needs_input", "need_input"}:
-        return COLOR_BLOCKED
-    return COLOR_LIVE if live else COLOR_SEALED
-
-
-def build_terminal_embed(
+def render_plain(
     *,
     remote_id: str,
     pane_id: str,
@@ -190,44 +163,38 @@ def build_terminal_embed(
     lines: list[str],
     segment_index: int,
     live: bool,
-) -> discord.Embed:
+) -> str:
     emoji = bridge_cfg.status_emoji.get(status, bridge_cfg.status_emoji.get("unknown", "❓"))
-    body_lines = list(lines)
-    body = "\n".join(body_lines)
-    while body_lines and len(body) + 8 > EMBED_BODY_LIMIT:
-        body_lines = body_lines[1:]
-        body = "\n".join(body_lines)
-
     if live:
-        title = f"{emoji} 终端输出"
+        head = f"{emoji} 【终端】{remote_id}:{pane_id} · {status}"
         if segment_index > 1:
-            title = f"{emoji} 终端输出（续 {segment_index}）"
+            head += f" · 续{segment_index}"
     else:
-        title = f"{emoji} 终端输出（第 {segment_index} 段）"
+        head = f"{emoji} 【终端·已固定】续{segment_index} · {remote_id}:{pane_id}"
+    body = "\n".join(lines)
+    content = f"{head}\n{body}" if body else head
+    # Hard trim if somehow over limit (should be prevented by fit).
+    if len(content) > 2000:
+        overflow = len(content) - 1990
+        content = content[: 1990 - overflow] + "\n…"
+    return content
 
-    embed = discord.Embed(
-        title=title,
-        description=f"```\n{body}\n```" if body else "```\n…\n```",
-        colour=_status_color(status, live=live),
-    )
-    embed.set_footer(text=f"{remote_id}:{pane_id} · {status} · 普通消息=你的输入")
-    return embed
 
-
-def _fit_count(lines: list[str]) -> int:
+def _fit_count(header: str, lines: list[str]) -> int:
     if not lines:
         return 0
     limit = min(len(lines), SEGMENT_MAX_LINES)
     for count in range(limit, 0, -1):
-        if len("\n".join(lines[:count])) + 8 <= EMBED_BODY_LIMIT:
+        body = "\n".join(lines[:count])
+        if len(header) + 1 + len(body) <= MSG_BODY_LIMIT:
             return count
     return 1
 
 
-def _live_overflows(lines: list[str]) -> bool:
+def _overflows(header: str, lines: list[str]) -> bool:
     if len(lines) > SEGMENT_MAX_LINES:
         return True
-    return len("\n".join(lines)) + 8 > EMBED_BODY_LIMIT
+    return len(header) + 1 + len("\n".join(lines)) > MSG_BODY_LIMIT
 
 
 async def begin_prompt_session(
@@ -242,13 +209,15 @@ async def begin_prompt_session(
         state.flush_task.cancel()
         state.flush_task = None
     state.pending = False
+    # Leave any previous live message untouched; open a new chain under this prompt.
     state.needs_new_message = True
     state.message_id = None
     state.anchor_message = prompt_message
     state.anchor_message_id = int(getattr(prompt_message, "id", 0) or 0) or None
     state.baseline_text = state.text
     state.session_lines = []
-    state.sealed_line_count = 0
+    state.posted_line_count = 0
+    state.live_start = 0
     state.segment_index = 0
     state.last_window = []
     if remote_id:
@@ -256,33 +225,41 @@ async def begin_prompt_session(
     state.choice_fingerprint = None
 
 
-async def _post_or_edit_embed(
+async def _send_new(
     thread: discord.Thread | Any,
     state: _TerminalState,
-    embed: discord.Embed,
+    content: str,
 ) -> Any:
-    if state.message_id is not None and not state.needs_new_message:
-        try:
-            msg = await thread.fetch_message(state.message_id)
-            await msg.edit(content=None, embed=embed)
-            return msg
-        except discord.NotFound:
-            state.message_id = None
-            state.needs_new_message = True
-
     msg: Any = None
     anchor = state.anchor_message
     if anchor is not None and hasattr(anchor, "reply"):
         try:
-            msg = await anchor.reply(embed=embed)
+            msg = await anchor.reply(content)
         except Exception:  # noqa: BLE001
             log.debug("prompt reply failed; falling back to thread.send", exc_info=True)
             msg = None
     if msg is None:
-        msg = await thread.send(embed=embed)
+        msg = await thread.send(content)
     state.message_id = int(msg.id)
     state.needs_new_message = False
     return msg
+
+
+async def _edit_live(
+    thread: discord.Thread | Any,
+    state: _TerminalState,
+    content: str,
+) -> Any:
+    if state.message_id is None or state.needs_new_message:
+        return await _send_new(thread, state, content)
+    try:
+        msg = await thread.fetch_message(state.message_id)
+        await msg.edit(content=content)
+        return msg
+    except discord.NotFound:
+        state.message_id = None
+        state.needs_new_message = True
+        return await _send_new(thread, state, content)
 
 
 async def apply_terminal_view(
@@ -306,7 +283,6 @@ async def apply_terminal_view(
     state.status = status or "unknown"
     added = absorb_gateway_window(state, text)
 
-    # Nothing new and we already have a live message → skip Discord work.
     if (
         added == 0
         and not force
@@ -376,54 +352,77 @@ async def _flush_state(
     *,
     clock: Callable[[], float],
 ) -> int | None:
+    """Publish only new lines after what was already posted; never rewrite sealed msgs."""
     state.pending = False
     remote_id = state.remote_id or "remote"
 
     if not state.session_lines and state.text:
         absorb_gateway_window(state, state.text)
 
-    live_lines = state.session_lines[state.sealed_line_count :]
-    if not live_lines:
-        return state.message_id
+    # Lines not yet reflected in any Discord message content for the live card.
+    # live card covers session_lines[live_start : ...]
+    # We grow the live card until full, then freeze it (never edit again) and continue.
 
     try:
-        # Only seal when the live buffer is too big — never per-line messages.
-        while _live_overflows(live_lines):
-            fit = _fit_count(live_lines)
-            if fit <= 0 or fit >= len(live_lines):
-                # Can't seal a proper prefix; trim live display only.
-                break
-            state.segment_index += 1
-            sealed = live_lines[:fit]
-            embed = build_terminal_embed(
+        while True:
+            live_lines = state.session_lines[state.live_start :]
+            if not live_lines:
+                return state.message_id
+
+            seg = state.segment_index + 1
+            header = render_plain(
                 remote_id=remote_id,
                 pane_id=pane_id,
                 status=state.status,
                 bridge_cfg=bridge_cfg,
-                lines=sealed,
+                lines=[],
+                segment_index=seg,
+                live=True,
+            ).split("\n", 1)[0]
+
+            if not _overflows(header, live_lines):
+                content = render_plain(
+                    remote_id=remote_id,
+                    pane_id=pane_id,
+                    status=state.status,
+                    bridge_cfg=bridge_cfg,
+                    lines=live_lines,
+                    segment_index=seg,
+                    live=True,
+                )
+                await _edit_live(thread, state, content)
+                state.posted_line_count = len(state.session_lines)
+                state.last_edit = clock()
+                return state.message_id
+
+            # Live card would overflow: finalize a fitted prefix as a frozen message,
+            # then open a new live message for the rest (previous content stays).
+            fit = _fit_count(header, live_lines)
+            if fit <= 0:
+                fit = 1
+            if fit >= len(live_lines):
+                # Can't split usefully; trim oldest within this live card only.
+                fit = max(1, len(live_lines) - 5)
+
+            sealed_lines = live_lines[:fit]
+            state.segment_index += 1
+            sealed_content = render_plain(
+                remote_id=remote_id,
+                pane_id=pane_id,
+                status=state.status,
+                bridge_cfg=bridge_cfg,
+                lines=sealed_lines,
                 segment_index=state.segment_index,
                 live=False,
             )
-            await _post_or_edit_embed(thread, state, embed)
-            state.sealed_line_count += fit
-            state.needs_new_message = True
+            # Write final content onto current live message, then detach so we never edit it again.
+            await _edit_live(thread, state, sealed_content)
+            state.live_start += fit
+            state.posted_line_count = state.live_start
             state.message_id = None
-            live_lines = state.session_lines[state.sealed_line_count :]
+            state.needs_new_message = True
             state.last_edit = clock()
-
-        live_index = state.segment_index + 1 if state.sealed_line_count else 1
-        embed = build_terminal_embed(
-            remote_id=remote_id,
-            pane_id=pane_id,
-            status=state.status,
-            bridge_cfg=bridge_cfg,
-            lines=live_lines,
-            segment_index=live_index,
-            live=True,
-        )
-        await _post_or_edit_embed(thread, state, embed)
-        state.last_edit = clock()
-        return state.message_id
+            # Loop to publish remainder as a new live message.
     except discord.HTTPException as exc:
-        log.warning("terminal view edit failed %s/%s: %s", remote_id, pane_id, exc)
+        log.warning("terminal view update failed %s/%s: %s", remote_id, pane_id, exc)
         return state.message_id
