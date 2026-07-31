@@ -61,6 +61,11 @@ class RemoteRegistry:
         with self._lock:
             return self._records.get(remote_id)
 
+    def list(self) -> list[RemoteRecord]:
+        """Return every registered remote, including unbound records."""
+        with self._lock:
+            return list(self._records.values())
+
     def list_unbound(self) -> list[RemoteRecord]:
         with self._lock:
             return [r for r in self._records.values() if r.channel_id is None]

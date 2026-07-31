@@ -83,18 +83,6 @@ class RemoteSeed:
 
 
 @dataclass(slots=True)
-class RemoteConfig:
-    """Deprecated SSH-era remote; kept for legacy bot/ssh imports until Task 10."""
-
-    id: str
-    host: str
-    user: str
-    ssh_key: Path
-    herdr_socket: str
-    port: int = 22
-
-
-@dataclass(slots=True)
 class AppConfig:
     discord: DiscordConfig
     bridge: BridgeConfig
@@ -103,7 +91,6 @@ class AppConfig:
     registry_path: Path
     mapping_path: Path
     log_dir: Path
-    remotes: list[RemoteConfig] = field(default_factory=list)
 
 
 def _parse_operators(raw: dict[str, Any]) -> OperatorsConfig:

@@ -25,8 +25,9 @@ class TlsFingerprintError(Exception):
 class GatewayClient:
     """Maintain control + push TLS sessions to a Gateway remote.
 
-    On control reconnect the caller must re-issue ``observe_pane`` for every
-    mapped pane; observe state is not restored automatically.
+    ``on_control_ready`` runs after every successful control connection, so
+    callers can re-issue ``observe_pane`` for mapped panes. Observe state is
+    intentionally not retained by the Gateway client itself.
     """
 
     def __init__(
@@ -34,11 +35,13 @@ class GatewayClient:
         remote: RemoteRecord,
         on_event: Callable[[dict], Awaitable[None]],
         *,
+        on_control_ready: Callable[[], Awaitable[None]] | None = None,
         min_backoff: float = 0.5,
         max_backoff: float = 30.0,
     ) -> None:
         self._remote = remote
         self._on_event = on_event
+        self._on_control_ready = on_control_ready
         self._min_backoff = min_backoff
         self._max_backoff = max_backoff
 
@@ -141,6 +144,13 @@ class GatewayClient:
                 self._control_reader = reader
                 self._control_writer = writer
                 self._control_ready.set()
+                if self._on_control_ready is not None:
+                    try:
+                        await self._on_control_ready()
+                    except Exception:  # noqa: BLE001
+                        # Connection is healthy even if a restore RPC fails; Runtime
+                        # logs individual observe failures and the caller may retry.
+                        pass
                 backoff = self._min_backoff
                 await self._control_lost.wait()
             except TlsFingerprintError as exc:
