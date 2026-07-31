@@ -1,10 +1,11 @@
-"""Chat-style Pane replies: one user message → one Bot reply (streamed via edits).
+"""Chat-style Pane replies with append-only history.
 
-Discord has no native token stream. The standard pattern is:
-  1. Reply immediately with a placeholder
-  2. Throttle-edit that same message as new Pane output arrives
-  3. If the reply hits the 2000-char cap, freeze it and continue on a new
-     message with only the remainder (previous text is never rewritten)
+Discord has no native token stream. Pattern:
+  1. Reply immediately with 「思考中…」
+  2. Append new Pane lines into an in-memory turn buffer (never drop earlier lines)
+  3. Throttle-edit the live Discord message as the buffer grows
+  4. When the live message nears 2000 chars, freeze it and continue on a new
+     「（续）」 message — earlier bubbles stay in channel history
 
 Approve / Yes-No buttons remain separate (choice_ui) when a real prompt appears.
 """
@@ -49,7 +50,7 @@ class _TurnState:
     anchor_message: Any | None = None
     anchor_message_id: int | None = None
     baseline_text: str | None = None
-    # Deduped lines for this user turn only
+    # Append-only lines for this user turn (full history, not just the pane tip)
     session_lines: list[str] = field(default_factory=list)
     live_start: int = 0
     segment_index: int = 0
@@ -137,12 +138,10 @@ def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
         return []
     if len(window) >= len(base) and window[: len(base)] == base:
         return list(window[len(base) :])
-    # Scrolled: longest suffix(base) == prefix(window)
     max_n = min(len(base), len(window))
     for n in range(max_n, 0, -1):
         if base[-n:] == window[:n]:
             return list(window[n:])
-    # Last baseline line still visible somewhere in the window
     last = base[-1]
     try:
         idx = len(window) - 1 - window[::-1].index(last)
@@ -152,11 +151,7 @@ def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
 
 
 def turn_lines_since_baseline(baseline: str | None, current: str) -> list[str]:
-    """Full chat-turn body for the latest pane snapshot (not an incremental append).
-
-    Returns [] when nothing has changed since the user prompt — caller keeps 「思考中…」.
-    If the sliding window loses the baseline, still recover visible post-prompt output.
-    """
+    """Best-effort first seed of post-prompt lines (used only when session is empty)."""
     window = str(current or "").splitlines()
     if not window:
         return []
@@ -165,12 +160,9 @@ def turn_lines_since_baseline(baseline: str | None, current: str) -> list[str]:
         return list(window)
     if window == base:
         return []
-
     delta = _delta_from_baseline(base, window)
     if delta:
         return delta
-
-    # In-place edits / partial scroll: walk baseline from the end for an anchor.
     for line in reversed(base):
         if line == "":
             continue
@@ -181,36 +173,58 @@ def turn_lines_since_baseline(baseline: str | None, current: str) -> list[str]:
         after = list(window[idx + 1 :])
         if after:
             return after
-        # Anchor is the last line but the line itself changed elsewhere — fall through.
-
-    # Screen cleared or baseline fully gone: the current window *is* the turn.
     return list(window)
 
 
-def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
-    """Recompute this turn's session_lines from the latest Gateway window.
+def _inplace_last_line_update(state: _TurnState, prev: list[str], window: list[str]) -> bool:
+    """Handle spinner / in-place last-line rewrites without dropping history."""
+    if not prev or not window or len(prev) != len(window):
+        return False
+    if prev[:-1] != window[:-1] or prev[-1] == window[-1]:
+        return False
+    if state.session_lines and state.session_lines[-1] == prev[-1]:
+        state.session_lines[-1] = window[-1]
+        return True
+    if not state.session_lines:
+        state.session_lines.append(window[-1])
+        return True
+    return False
 
-    Returns 0 when the visible turn body is unchanged (keep 「思考中…」 / skip edit).
+
+def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
+    """Append newly visible Pane lines into this turn's history.
+
+    Never replaces earlier session_lines with the current sliding window tip —
+    that was wiping Discord history down to “only the latest screen”.
     """
     window = str(snapshot or "").splitlines()
-    turn = turn_lines_since_baseline(state.baseline_text, snapshot)
-    state.last_window = list(window)
-    if turn == state.session_lines:
+    if window == state.last_window:
         return 0
-    # Sealed Discord segments stay put; only replace the unsent tail when possible.
-    sealed = state.session_lines[: state.live_start]
-    if sealed and len(turn) >= len(sealed) and turn[: len(sealed)] == sealed:
-        state.session_lines = list(turn)
-    elif sealed:
-        # Prefix no longer matches (hard scroll) — restart live rendering on new body.
-        state.session_lines = list(turn)
-        state.live_start = 0
-        state.segment_index = 0
-        state.needs_new_message = True
-        state.message_id = None
+    prev = list(state.last_window)
+    state.last_window = list(window)
+
+    added: list[str] = []
+    if not state.session_lines:
+        base = str(state.baseline_text or "").splitlines()
+        added = _delta_from_baseline(base, window)
+        if not added and prev:
+            added = new_lines_from_window(prev, window)
+        if not added and _inplace_last_line_update(state, prev, window):
+            return 1
+        if not added and window != base:
+            # First post-prompt snapshot lost the baseline — seed once.
+            added = turn_lines_since_baseline(state.baseline_text, snapshot)
     else:
-        state.session_lines = list(turn)
-    return 1
+        added = new_lines_from_window(state.session_lines, window)
+        if not added and prev:
+            added = new_lines_from_window(prev, window)
+        if not added and _inplace_last_line_update(state, prev, window):
+            return 1
+
+    if not added:
+        return 0
+    state.session_lines.extend(added)
+    return len(added)
 
 
 def session_body(baseline: str | None, current: str, max_lines: int) -> str:

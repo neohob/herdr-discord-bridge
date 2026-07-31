@@ -239,9 +239,58 @@ async def test_lost_baseline_still_shows_window():
     assert "思考中" not in body
 
 
-def test_turn_lines_unchanged_is_empty():
-    from src.bot.terminal_view import turn_lines_since_baseline
+@pytest.mark.asyncio
+async def test_append_keeps_earlier_lines_after_scroll():
+    """Sliding pane tip must not wipe earlier turn history from Discord buffer."""
+    clock = FakeClock(1000.0)
+    thread = AsyncMock()
+    thread.id = 8
+    reply = MagicMock(id=13, edit=AsyncMock())
+    cont = MagicMock(id=14, edit=AsyncMock())
+    prompt = MagicMock(id=6)
+    prompt.reply = AsyncMock(side_effect=[reply, cont])
+    thread.fetch_message = AsyncMock(return_value=reply)
+    thread.send = AsyncMock(return_value=cont)
+    cfg = _bridge(edit_cooldown=0.0)
 
-    assert turn_lines_since_baseline("a\nb", "a\nb") == []
-    assert turn_lines_since_baseline("a\nb", "a\nb\nc") == ["c"]
-    assert turn_lines_since_baseline("a\nb", "x\ny") == ["x", "y"]
+    await begin_prompt_session(thread, "p1", prompt, remote_id="r")
+    state = get_terminal_state(thread, "p1")
+    state.baseline_text = "base"
+    state.last_window = ["base"]
+    state.session_lines = []
+
+    await apply_terminal_view(thread, "p1", "base\nearly\nmiddle", "working", cfg, clock=clock.now)
+    assert state.session_lines == ["early", "middle"]
+
+    # Window scrolled: "early" fell off the pane tip; only middle+late visible.
+    clock.advance(2.0)
+    await apply_terminal_view(thread, "p1", "middle\nlate", "working", cfg, clock=clock.now)
+    assert state.session_lines == ["early", "middle", "late"]
+    assert "early" in _text(reply.edit.await_args)
+    assert "late" in _text(reply.edit.await_args)
+
+
+@pytest.mark.asyncio
+async def test_long_turn_seals_and_continues_new_message():
+    clock = FakeClock(1000.0)
+    thread = AsyncMock()
+    thread.id = 9
+    reply = MagicMock(id=20, edit=AsyncMock())
+    cont = MagicMock(id=21, edit=AsyncMock())
+    prompt = MagicMock(id=7)
+    prompt.reply = AsyncMock(side_effect=[reply, cont])
+    thread.fetch_message = AsyncMock(side_effect=[reply, cont])
+    cfg = _bridge(edit_cooldown=0.0)
+
+    await begin_prompt_session(thread, "p1", prompt, remote_id="r")
+    state = get_terminal_state(thread, "p1")
+    state.baseline_text = ""
+    state.last_window = []
+    state.session_lines = []
+
+    # Build enough lines to exceed SOFT_LIMIT when rendered.
+    lines = [f"line-{i}-" + ("x" * 80) for i in range(40)]
+    await apply_terminal_view(thread, "p1", "\n".join(lines), "working", cfg, clock=clock.now)
+    assert state.segment_index >= 1 or state.live_start > 0 or prompt.reply.await_count >= 2
+    # First bubble was edited (sealed or live); history not discarded from buffer.
+    assert len(state.session_lines) == 40

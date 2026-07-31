@@ -1,145 +1,148 @@
 # Herdr Discord Bridge
 
-把多台机器上的 [Herdr](https://herdr.dev) Pane 映射进 Discord：在频道/线程里对话即可向对应 Pane 发送命令，并接收终端画面推送。
+[中文文档](readme_zh-cn.md)
 
-- **机器人（Discord Bot）**：连接 Discord；经网络访问各主机上的 TLS 插件。可用 Docker 部署（本机 / Unraid），便于迁移。
-- **主机插件（Herdr Plugin）**：装在**每一台运行 Herdr 的机器**上，桥接本机 `herdr.sock` 与 TLS 端口。必须与 Herdr 同机（Unix socket，不能跨网挂 sock）。
+Map [Herdr](https://herdr.dev) panes from multiple hosts into Discord: chat in a channel/thread to drive the matching pane, and receive live terminal output.
 
-> 本文「机器人」= Discord 进程；「主机插件」= 各 Herdr 主机上的插件。勿与「一台中心 Gateway 直连所有 herdr.sock」混淆。
+- **Bot (Discord Bot):** connects to Discord and reaches each host’s TLS plugin over the network. Deploy with Docker (local or Unraid) so it can move with you.
+- **Host plugin (Herdr Plugin):** runs on **every machine that runs Herdr**, bridging local `herdr.sock` to a TLS port. It must be co-located with Herdr (Unix socket; do not expose the sock across the network).
 
-## 架构
+> In this doc, **Bot** = the Discord process; **host plugin** = the plugin on each Herdr host. Do not confuse this with “one central gateway talking to every `herdr.sock`.”
+
+## Architecture
 
 ```text
-Discord 用户
+Discord user
     ↕ Discord API
-机器人（Docker，可放 Unraid；建议与 Tailscale 容器共用网络）
-    ↕ Tailscale / 内网  TLS NDJSON :9876
-主机插件（每台 Herdr 主机各一个）
+Bot (Docker; Unraid OK; prefer sharing Tailscale container network)
+    ↕ Tailscale / LAN  TLS NDJSON :9876
+Host plugin (one per Herdr host)
     ↕ Unix
 herdr.sock → Pane / Workspace / Tab
 ```
 
-| Discord 概念 | 含义 |
-|--------------|------|
-| Remote 频道 | 一台已注册主机（一个主机插件端点） |
-| Pane 线程 | 该主机上的一个 Herdr Pane |
-| 线程内聊天 | 转发为 `pane.send_text` + `pane.send_keys Enter` |
-| Terminal Message | 线程内由推送更新的终端画面 |
+| Discord concept | Meaning |
+|-----------------|--------|
+| Remote channel | One registered host (one host-plugin endpoint) |
+| Pane thread | One Herdr Pane on that host |
+| Chat in the thread | Forwarded as `pane.send_text` + `pane.send_keys Enter` |
+| Terminal message | Bot bubble updated from push events |
 
-跨 Tailscale 主机：每台装主机插件；在 Discord `/herdr register` 时填该机的 **Tailscale IP**、端口、token、证书指纹。
+Across Tailscale hosts: install the host plugin on each machine; in Discord `/herdr register`, use that host’s **Tailscale IP**, port, token, and cert fingerprint.
 
-## 仓库结构
+## Repository layout
 
 ```text
 src/
-  bot/                 # Discord 机器人
-  plugin/              # Herdr 主机插件（herdr-plugin.toml + gateway + ctl.sh）
-  shared/              # NDJSON / TLS 指纹等共用逻辑
+  bot/                 # Discord bot
+  plugin/              # Herdr host plugin (herdr-plugin.toml + gateway + ctl.sh)
+  shared/              # Shared NDJSON / TLS fingerprint helpers
 docker/
   gateway-entrypoint.sh
-  unraid-herdr-gateway.xml   # Unraid DockerMan 模板（主机插件镜像，可选）
-Dockerfile             # 机器人镜像
-Dockerfile.gateway     # 主机插件镜像（可选，无 Herdr 的机器勿单独用）
-docker-compose.yml     # 通用机器人 Compose
-docker-compose.unraid.yml  # Unraid：机器人 network_mode=container:Tailscale-Docker
+  unraid-herdr-gateway.xml   # Optional Unraid DockerMan template (host plugin image)
+Dockerfile             # Bot image
+Dockerfile.gateway     # Host plugin image (optional; do not run alone without Herdr)
+docker-compose.yml     # Generic bot Compose
+docker-compose.unraid.yml  # Unraid: bot network_mode=container:Tailscale-Docker
 config.example.yaml
-docs/                  # 设计 / ADR / CONTEXT
+docs/                  # Design / ADR / CONTEXT
+readme_zh-cn.md        # Chinese documentation
 ```
 
-## 1. 主机插件（每台 Herdr 机器）
+## 1. Host plugin (each Herdr machine)
 
-### 要求
+### Requirements
 
 - Herdr ≥ 0.7
-- 本机存在 `herdr.sock`（常见：`~/.config/herdr/herdr.sock`）
-- 防火墙 / Tailscale 放行监听端口（默认 `9876`）
+- Local `herdr.sock` (often `~/.config/herdr/herdr.sock`)
+- Firewall / Tailscale allows the listen port (default `9876`)
 
-### 安装与启停
+### Install and lifecycle
 
 ```bash
-# 在仓库根目录
+# From the repo root
 herdr plugin link "$(pwd)/src/plugin"
 
 herdr plugin action invoke setup  --plugin herdr-discord-bridge
 herdr plugin action invoke start  --plugin herdr-discord-bridge
 herdr plugin action invoke status --plugin herdr-discord-bridge
-# stop / teardown 同理
+# stop / teardown likewise
 ```
 
-`setup` 会生成 token、自签证书，并打印供 Discord 注册用的信息。配置目录一般在：
+`setup` creates a token and self-signed cert, and prints values for Discord registration. Config usually lives under:
 
 ```text
 ~/.config/herdr/plugins/config/herdr-discord-bridge/
 ```
 
-也可用脚本（等价）：
+Or via the control script (equivalent):
 
 ```bash
 HERDR_PLUGIN_CONFIG_DIR=~/.config/herdr/plugins/config/herdr-discord-bridge \
   bash src/plugin/scripts/ctl.sh setup|start|stop|status
 ```
 
-可选环境变量：`GATEWAY_LISTEN_PORT`（默认 `9876`）、`GATEWAY_PUBLIC_HOST`（打印用的对外 IP 提示）。
+Optional env: `GATEWAY_LISTEN_PORT` (default `9876`), `GATEWAY_PUBLIC_HOST` (hint printed as the public IP).
 
-### 注册时建议填写
+### Fields to register
 
-| 字段 | 说明 |
-|------|------|
-| host | 该机 Tailscale IP（推荐）或可达内网 IP；机器人与插件同机可用 `127.0.0.1` |
-| port | 默认 `9876` |
-| token | setup 输出 |
-| fingerprint | 证书 SHA-256 十六进制（64 字符） |
+| Field | Notes |
+|-------|--------|
+| host | That machine’s Tailscale IP (preferred) or reachable LAN IP; use `127.0.0.1` if bot and plugin share a host |
+| port | Default `9876` |
+| token | From setup |
+| fingerprint | Cert SHA-256 hex (64 chars) |
 
-## 2. 机器人（Discord Bot）
+## 2. Bot (Discord Bot)
 
-### Discord 开发者后台
+### Discord developer portal
 
-1. 创建 Application → Bot，复制 Token  
-2. 打开 **Message Content Intent**  
-3. **OAuth2 → Requires OAuth2 Code Grant** 关闭  
-4. 邀请链接（替换 `CLIENT_ID`）：
+1. Create an Application → Bot, copy the token  
+2. Enable **Message Content Intent**  
+3. Turn **OAuth2 → Requires OAuth2 Code Grant** off  
+4. Invite URL (replace `CLIENT_ID`):
 
 ```text
 https://discord.com/api/oauth2/authorize?client_id=CLIENT_ID&permissions=8&scope=bot%20applications.commands
 ```
 
-5. 邀请到目标服务器后，复制**服务器 ID**（开发者模式）写入配置 `guild_id`
+5. After inviting to the target guild, copy the **guild ID** (Developer Mode) into `guild_id`
 
-### 配置文件
+### Config
 
 ```bash
 cp config.example.yaml config.yaml
 cp .env.example .env
 ```
 
-`.env`：
+`.env`:
 
 ```bash
-DISCORD_TOKEN=你的BotToken
+DISCORD_TOKEN=your-bot-token
 LOG_LEVEL=info
 ```
 
-`config.yaml` 要点：
+`config.yaml` highlights:
 
-| 字段 | 说明 |
-|------|------|
-| `discord.guild_id` | 运行机器人的服务器 ID |
-| `discord.token` | 可用 `"${DISCORD_TOKEN}"` |
-| `operators.require_manage_guild` | `true` 时需 Manage Guild（或匹配 role） |
-| `operators.user_ids` / `role_ids` | 可选限制操作者 |
-| `bridge.terminal.max_lines` | 终端画面行数 |
-| `bridge.terminal.edit_cooldown` | Discord 消息编辑冷却（秒） |
-| `seed_remotes` | 可选；首次写入 `cache/remotes.json`，之后以 Discord 注册为准 |
+| Key | Notes |
+|-----|--------|
+| `discord.guild_id` | Guild where the bot runs |
+| `discord.token` | May be `"${DISCORD_TOKEN}"` |
+| `operators.require_manage_guild` | When `true`, need Manage Guild (or a matching role) |
+| `operators.user_ids` / `role_ids` | Optional operator allowlists |
+| `bridge.terminal.max_lines` | Terminal view line count |
+| `bridge.terminal.edit_cooldown` | Discord message edit cooldown (seconds) |
+| `seed_remotes` | Optional; seeds `cache/remotes.json` once, then Discord registration wins |
 
-数据目录：
+Data dirs:
 
-- `cache/remotes.json` — Remote 注册表（token/指纹等）  
-- `cache/mapping.json` — 频道 / 线程映射  
-- `logs/` — 日志  
+- `cache/remotes.json` — remote registry (tokens / fingerprints)  
+- `cache/mapping.json` — channel / thread mapping  
+- `logs/` — logs  
 
-**不要把 `.env` / `config.yaml` / `cache/remotes.json` 提交进 git。**
+**Do not commit `.env`, `config.yaml`, or `cache/remotes.json`.**
 
-### 本机直接跑
+### Run locally
 
 ```bash
 export $(grep -v '^#' .env | xargs)
@@ -147,98 +150,98 @@ export BRIDGE_CONFIG="$PWD/config.yaml" PYTHONPATH=.
 python -m src.bot
 ```
 
-### Docker Compose（通用）
+### Docker Compose (generic)
 
 ```bash
 docker compose up -d --build
 ```
 
-挂载：`config.yaml`、`cache/`、`logs/`。
+Mounts: `config.yaml`, `cache/`, `logs/`.
 
-### Unraid + Tailscale（推荐）
+### Unraid + Tailscale (recommended)
 
-机器人与 `Tailscale-Docker` **共用网络命名空间**，才能访问各机 `100.x:9876`：
+Share the Bot’s network namespace with `Tailscale-Docker` so it can reach each host’s `100.x:9876`:
 
 ```bash
-# 见 docker-compose.unraid.yml
+# See docker-compose.unraid.yml
 # network_mode: "container:Tailscale-Docker"
 ```
 
-注意：Unraid 若无有 `docker compose` v2，可用等价 `docker run --network container:Tailscale-Docker ...`。  
-镜像构建用仓库根目录 `Dockerfile`。配置建议放在：
+If Unraid lacks `docker compose` v2, use an equivalent `docker run --network container:Tailscale-Docker ...`.  
+Build from the repo-root `Dockerfile`. Suggested appdata layout:
 
 ```text
 /mnt/user/appdata/herdr-discord-bridge/{config.yaml,.env,cache,logs}
 ```
 
-同一 Bot Token **只能跑一个机器人实例**。
+Only **one** bot process may use a given Bot Token.
 
-## 3. Discord 用法
+## 3. Discord usage
 
-在目标服务器的**文字频道**中（需 Operator 权限）：
+In a text channel of the target guild (Operator permission required):
 
-### 注册一台主机并开频道
+### Register a host and open a channel
 
 ```text
 /herdr register
 ```
 
-| 选项 | 示例 |
-|------|------|
-| host | `100.x.x.x`（Tailscale） |
+| Option | Example |
+|--------|---------|
+| host | `100.x.x.x` (Tailscale) |
 | port | `9876` |
-| token / fingerprint | 主机插件 setup 输出 |
-| id | 可选，如 `macbook` |
-| create_channel | `True` → 自动建 Remote 频道 |
+| token / fingerprint | From host-plugin setup |
+| id | Optional, e.g. `macbook` |
+| create_channel | `True` → create the Remote channel |
 
-### 同步 Pane → 线程
+### Sync panes → threads
 
-进入 Remote 频道：
+In the Remote channel:
 
 ```text
 /herdr sync
 ```
 
-会按 Herdr **实时** `workspace.list` / `tab.list` / `pane.list` 建或重命名线程，格式类似：
+Builds or renames threads from live Herdr `workspace.list` / `tab.list` / `pane.list`, e.g.:
 
 ```text
 🟢 JinAn-MAP › cursor · Cursor Agent [wB:p6]
 ```
 
-（工作区名 › Tab label · 显示名 [pane_id]，无静态对照表。）
+(workspace › tab label · display name `[pane_id]` — not a static lookup table.)
 
-### 日常
+### Day-to-day
 
-| 操作 | 方式 |
-|------|------|
-| 向 Pane 发命令 | **聊天模式**：你发一条 → 立刻「正在输入…」+ 回复「思考中…」，同条消息节流刷新；超长才会「续」下一条 |
-| Approve / 选择 | 仅在真正确认提示 / `blocked` 时出 Yes/No/Custom |
-| 看输出 | 纯文本 Bot 气泡；没有输入时不刷屏 |
-| 列表 / 读写 | `/herdr pane list\|read\|…` |
-| 状态 | `/herdr status` |
-| 换绑频道 | 在新频道 `/herdr rebind` |
-| 帮助 | `/herdr help` |
+| Action | How |
+|--------|-----|
+| Send to a Pane | **Chat mode:** one user message → “思考中…” / thinking placeholder; output is **append-only** (edits the same bubble); when full, seal and continue with a “（续）” follow-up so channel history stays readable |
+| Approve / choose | Yes/No/Custom only on real confirm prompts / `blocked` |
+| Read output | Plain-text bot bubbles; no spam when idle |
+| List / read / … | `/herdr pane list\|read\|…` |
+| Status | `/herdr status` |
+| Rebind channel | `/herdr rebind` in the new channel |
+| Help | `/herdr help` |
 
-斜杠命令若未出现：等 1～2 分钟或重开客户端；确认机器人在线且 `guild_id` 正确。
+If slash commands are missing: wait 1–2 minutes or restart the client; confirm the bot is online and `guild_id` is correct.
 
-## 4. 常见问题
+## 4. Troubleshooting
 
-| 现象 | 处理 |
-|------|------|
-| 「应用程序未响应」 | 多为 sync 建线程较慢；已 defer。稍后重试 `/herdr sync` |
-| 文字进了 Pane 但不执行 | 需 `send_keys Enter`（勿只发 `\n`）。请使用当前版本机器人 |
-| 只能看到 NVBOT 联系人 | 需用含 `bot` scope 的链接邀请进**服务器** |
-| Unraid 机器人连不上 `100.x` | 使用 `--network container:Tailscale-Docker`（或宿主机已装 Tailscale） |
-| 删 Remote 频道 | 凭证保留，可在新频道 `rebind`；真正删主机用 `/herdr remove` |
+| Symptom | What to try |
+|---------|-------------|
+| “Application did not respond” | Sync creating threads can be slow (deferred). Retry `/herdr sync` |
+| Text reaches the Pane but does not run | Needs `send_keys Enter` (a bare `\n` is not enough). Use a current bot build |
+| You only see the bot as a DM contact | Invite with a URL that includes the `bot` scope into a **server** |
+| Unraid bot cannot reach `100.x` | Use `--network container:Tailscale-Docker` (or Tailscale on the host) |
+| Deleted Remote channel | Credentials remain; `rebind` in a new channel. To drop the host use `/herdr remove` |
 
-## 5. 开发与测试
+## 5. Development and tests
 
 ```bash
-python -m pip install -r requirements.txt   # 或 pip install -e ".[dev]"
+python -m pip install -r requirements.txt   # or pip install -e ".[dev]"
 PYTHONPATH=. pytest -q
 ```
 
-更细的设计与术语见：
+More design and terminology:
 
 - [docs/superpowers/specs/2026-07-31-herdr-discord-bridge-design.md](docs/superpowers/specs/2026-07-31-herdr-discord-bridge-design.md)
 - [CONTEXT.md](CONTEXT.md)
