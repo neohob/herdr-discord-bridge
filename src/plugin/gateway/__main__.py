@@ -8,10 +8,10 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from src.plugin.gateway.config import load_gateway_config
-from src.plugin.gateway.herdr_unix import HerdrUnixClient
-from src.plugin.gateway.push_pump import PushPump
-from src.plugin.gateway.server import PushHub, serve_gateway
+from .config import load_gateway_config
+from .herdr_unix import HerdrUnixClient
+from .push_pump import PushPump
+from .server import PushHub, serve_gateway
 
 
 def _config_path() -> Path:

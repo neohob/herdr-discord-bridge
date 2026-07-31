@@ -1,35 +1,51 @@
 #!/usr/bin/env bash
-# Herdr Discord Bridge Gateway — plugin control script (English user-facing output).
+# Herdr Discord Bridge — host plugin control (English user-facing output).
+# Spec: https://herdr.dev/docs/plugins/
 #
-# Run the gateway module with the repository root on PYTHONPATH, e.g.:
-#   export PYTHONPATH="/path/to/herdr-discord-bridge"
-#   python -m src.plugin.gateway
-#
-# ctl.sh sets PYTHONPATH automatically when starting the gateway.
+# Config  → HERDR_PLUGIN_CONFIG_DIR  (token, certs, config.yaml)
+# State   → HERDR_PLUGIN_STATE_DIR   (pid, logs)
+# Socket  → HERDR_SOCKET_PATH        (injected by Herdr)
+# Binary  → HERDR_BIN_PATH           (preferred when calling `herdr` CLI)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${PLUGIN_ROOT}/../.." && pwd)"
+# Monorepo checkout: src/plugin → repo root. Standalone install: empty.
+REPO_ROOT=""
+if [[ -f "${PLUGIN_ROOT}/../../pyproject.toml" && -d "${PLUGIN_ROOT}/../../src/shared" ]]; then
+  REPO_ROOT="$(cd "${PLUGIN_ROOT}/../.." && pwd)"
+fi
 
-DEFAULT_CONFIG_DIR="${HOME}/.config/herdr-discord-bridge"
-DEFAULT_SOCKET="${HOME}/.config/herdr/herdr.sock"
 DEFAULT_LISTEN_HOST="0.0.0.0"
 DEFAULT_LISTEN_PORT="9876"
+DEFAULT_SOCKET="${HOME}/.config/herdr/herdr.sock"
 
 PID_FILE_NAME="gateway.pid"
 LOG_FILE_NAME="gateway.log"
 
 config_dir() {
-  printf '%s\n' "${HERDR_PLUGIN_CONFIG_DIR:-${DEFAULT_CONFIG_DIR}}"
+  if [[ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ]]; then
+    printf '%s\n' "${HERDR_PLUGIN_CONFIG_DIR}"
+    return
+  fi
+  # Match Herdr's per-plugin config layout when env is missing (manual runs).
+  printf '%s\n' "${HOME}/.config/herdr/plugins/config/herdr-discord-bridge"
+}
+
+state_dir() {
+  if [[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]]; then
+    printf '%s\n' "${HERDR_PLUGIN_STATE_DIR}"
+    return
+  fi
+  printf '%s\n' "${HOME}/.config/herdr/plugins/state/herdr-discord-bridge"
 }
 
 pid_file() {
-  printf '%s\n' "$(config_dir)/${PID_FILE_NAME}"
+  printf '%s\n' "$(state_dir)/${PID_FILE_NAME}"
 }
 
 log_file() {
-  printf '%s\n' "$(config_dir)/${LOG_FILE_NAME}"
+  printf '%s\n' "$(state_dir)/${LOG_FILE_NAME}"
 }
 
 config_file() {
@@ -42,6 +58,19 @@ cert_file() {
 
 key_file() {
   printf '%s\n' "$(config_dir)/gateway.key"
+}
+
+pythonpath_value() {
+  # Plugin root first so `gateway` + vendored `shared` resolve for GitHub installs.
+  if [[ -n "${REPO_ROOT}" ]]; then
+    printf '%s:%s\n' "${PLUGIN_ROOT}" "${REPO_ROOT}"
+  else
+    printf '%s\n' "${PLUGIN_ROOT}"
+  fi
+}
+
+run_python() {
+  PYTHONPATH="$(pythonpath_value)${PYTHONPATH:+:${PYTHONPATH}}" "$(python_bin)" "$@"
 }
 
 detect_host() {
@@ -83,6 +112,10 @@ herdr_socket() {
   printf '%s\n' "${DEFAULT_SOCKET}"
 }
 
+herdr_bin() {
+  printf '%s\n' "${HERDR_BIN_PATH:-herdr}"
+}
+
 remote_id_suggestion() {
   local h
   h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo remote)"
@@ -102,16 +135,16 @@ python_bin() {
 }
 
 generate_token() {
-  "$(python_bin)" -c 'import secrets; print(secrets.token_urlsafe(32))'
+  run_python -c 'import secrets; print(secrets.token_urlsafe(32))'
 }
 
 generate_tls() {
   local cert key
   cert="$(cert_file)"
   key="$(key_file)"
-  PYTHONPATH="${REPO_ROOT}" "$(python_bin)" -c "
+  run_python -c "
 from pathlib import Path
-from src.plugin.gateway.tls_util import generate_self_signed
+from gateway.tls_util import generate_self_signed
 print(generate_self_signed(Path('${cert}'), Path('${key}')))
 "
 }
@@ -119,9 +152,9 @@ print(generate_self_signed(Path('${cert}'), Path('${key}')))
 read_fingerprint() {
   local cert
   cert="$(cert_file)"
-  PYTHONPATH="${REPO_ROOT}" "$(python_bin)" -c "
+  run_python -c "
 from pathlib import Path
-from src.plugin.gateway.tls_util import fingerprint_from_cert_file
+from gateway.tls_util import fingerprint_from_cert_file
 print(fingerprint_from_cert_file(Path('${cert}')))
 "
 }
@@ -154,7 +187,7 @@ EOF
 
 print_register_snippet() {
   local host port token fingerprint rid cfg
-  host="$(detect_host)"
+  host="${GATEWAY_PUBLIC_HOST:-$(detect_host)}"
   port="${GATEWAY_LISTEN_PORT:-${DEFAULT_LISTEN_PORT}}"
   token="$1"
   fingerprint="$2"
@@ -167,16 +200,20 @@ print_register_snippet() {
  Discord Bridge — Gateway setup complete
 ════════════════════════════════════════════════════════════
 
-Gateway config written to:
+Plugin config (HERDR_PLUGIN_CONFIG_DIR):
+  $(config_dir)
+
+Plugin state (HERDR_PLUGIN_STATE_DIR):
+  $(state_dir)
+
+Gateway config:
   ${cfg}
 
-TLS certificate:
+TLS certificate / key:
   $(cert_file)
-
-TLS private key:
   $(key_file)
 
-Register this Remote in the Discord Bot (via /herdr or bot config):
+Register this Remote in the Discord Bot (/herdr register or bot config):
 
 remotes:
   - id: ${rid}
@@ -185,13 +222,14 @@ remotes:
     token: ${token}
     fingerprint: ${fingerprint}
 
-Host hint (for operators): ${host}
 Herdr socket: $(herdr_socket)
+Herdr binary: $(herdr_bin)
 
-Start the gateway:
-  HERDR_PLUGIN_CONFIG_DIR=$(config_dir) bash ${SCRIPT_DIR}/ctl.sh start
+Start:
+  herdr plugin action invoke start --plugin herdr-discord-bridge
 
-The gateway runs as: PYTHONPATH=${REPO_ROOT} python -m src.plugin.gateway
+Or:
+  bash ${SCRIPT_DIR}/ctl.sh start
 ════════════════════════════════════════════════════════════
 
 EOF
@@ -200,7 +238,7 @@ EOF
 cmd_setup() {
   local dir token fingerprint
   dir="$(config_dir)"
-  mkdir -p "${dir}"
+  mkdir -p "${dir}" "$(state_dir)"
 
   token="$(generate_token)"
   fingerprint="$(generate_tls)"
@@ -229,7 +267,7 @@ cmd_start() {
 
   if [[ ! -f "${cfg}" ]]; then
     echo "error: config not found at ${cfg}" >&2
-    echo "Run setup first: HERDR_PLUGIN_CONFIG_DIR=$(config_dir) bash ${SCRIPT_DIR}/ctl.sh setup" >&2
+    echo "Run setup first: herdr plugin action invoke setup --plugin herdr-discord-bridge" >&2
     exit 1
   fi
 
@@ -239,10 +277,16 @@ cmd_start() {
   fi
 
   export HERDR_PLUGIN_CONFIG_DIR="$(config_dir)"
-  export PYTHONPATH="${REPO_ROOT}"
-  mkdir -p "$(config_dir)"
+  export HERDR_PLUGIN_STATE_DIR="$(state_dir)"
+  mkdir -p "$(config_dir)" "$(state_dir)"
 
-  nohup "$(python_bin)" -m src.plugin.gateway >>"${lf}" 2>&1 &
+  # Long-lived process: start action backgrounds it (Herdr [[startup]] must exit).
+  nohup env \
+    HERDR_PLUGIN_CONFIG_DIR="$(config_dir)" \
+    HERDR_PLUGIN_STATE_DIR="$(state_dir)" \
+    HERDR_SOCKET_PATH="$(herdr_socket)" \
+    PYTHONPATH="$(pythonpath_value)${PYTHONPATH:+:${PYTHONPATH}}" \
+    "$(python_bin)" -m gateway >>"${lf}" 2>&1 &
   echo $! >"${pf}"
   sleep 0.5
 
@@ -296,15 +340,18 @@ cmd_status() {
   fi
 
   cat <<EOF
+plugin_id:      herdr-discord-bridge
+plugin_root:    ${PLUGIN_ROOT}
 config_dir:     $(config_dir)
+state_dir:      $(state_dir)
 config_file:    ${cfg} $([ -f "${cfg}" ] && echo '[ok]' || echo '[missing]')
 pid_file:       ${pf}
 running:        ${running}
 log_file:       ${lf}
-host_hint:      $(detect_host)
+host_hint:      ${GATEWAY_PUBLIC_HOST:-$(detect_host)}
 herdr_socket:   $(herdr_socket)
-repo_root:      ${REPO_ROOT}
-gateway_cmd:    PYTHONPATH=${REPO_ROOT} python -m src.plugin.gateway
+herdr_bin:      $(herdr_bin)
+gateway_cmd:    PYTHONPATH=$(pythonpath_value) python -m gateway
 EOF
 
   if [[ -f "${cfg}" ]]; then
@@ -322,28 +369,30 @@ cmd_teardown() {
     cmd_stop
   fi
 
-  local dir
-  dir="$(config_dir)"
-  echo "Teardown complete. Config and TLS files remain in:"
-  echo "  ${dir}"
-  echo "Delete that directory manually if you want a full reset."
+  echo "Teardown complete. Config/TLS remain in:"
+  echo "  $(config_dir)"
+  echo "Runtime state remains in:"
+  echo "  $(state_dir)"
+  echo "Delete those directories manually for a full reset."
 }
 
 usage() {
   cat <<EOF
 usage: ctl.sh <setup|start|stop|status|teardown>
 
-Herdr Discord Bridge Gateway plugin control.
+Herdr Discord Bridge host plugin control.
+Docs: https://herdr.dev/docs/plugins/
 
-Environment:
-  HERDR_PLUGIN_CONFIG_DIR  Config directory (default: ${DEFAULT_CONFIG_DIR})
-  HERDR_SOCKET_PATH        Override Herdr Unix socket path
+Environment (injected by Herdr when using plugin actions):
+  HERDR_PLUGIN_CONFIG_DIR  User config (default under ~/.config/herdr/plugins/config/)
+  HERDR_PLUGIN_STATE_DIR   Runtime state (default under ~/.config/herdr/plugins/state/)
+  HERDR_SOCKET_PATH        Herdr Unix socket / named pipe
+  HERDR_BIN_PATH           Herdr CLI binary (portable)
+  HERDR_PLUGIN_ROOT        Linked/installed plugin directory
   GATEWAY_LISTEN_HOST      Listen address (default: ${DEFAULT_LISTEN_HOST})
   GATEWAY_LISTEN_PORT      Listen port (default: ${DEFAULT_LISTEN_PORT})
+  GATEWAY_PUBLIC_HOST      Host printed for Discord register
   PYTHON                   Python interpreter (default: python3)
-
-Gateway module (requires PYTHONPATH=${REPO_ROOT}):
-  python -m src.plugin.gateway
 EOF
 }
 

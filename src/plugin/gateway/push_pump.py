@@ -7,9 +7,9 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from src.plugin.gateway.ansi import strip_ansi
-from src.plugin.gateway.herdr_unix import HerdrUnixClient, HerdrUnixSubscriber
-from src.plugin.gateway.server import PushHub
+from .ansi import strip_ansi
+from .herdr_unix import HerdrUnixClient, HerdrUnixSubscriber
+from .server import PushHub
 
 DEFAULT_SUBSCRIPTIONS: list[dict[str, str]] = [
     {"type": "workspace.created"},

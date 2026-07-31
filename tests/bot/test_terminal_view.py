@@ -15,6 +15,7 @@ from src.bot.terminal_view import (
     get_terminal_state,
     new_lines_from_window,
     render_chat_reply,
+    window_diff_lines,
 )
 
 
@@ -50,6 +51,14 @@ def _text(call) -> str:
 def test_new_lines_no_dupes():
     assert new_lines_from_window(["a", "b"], ["b", "c"]) == ["c"]
     assert new_lines_from_window(["a", "b", "c"], ["a", "b", "c"]) == []
+
+
+def test_window_diff_captures_scroll_and_inplace():
+    assert window_diff_lines(["a", "b", "c"], ["b", "c", "d"]) == ["d"]
+    # In-place rewrite of the last line.
+    assert window_diff_lines(["a", "b"], ["a", "b2"]) == ["b2"]
+    # Full screen replace must not return empty.
+    assert window_diff_lines(["old1", "old2"], ["new1", "new2"]) == ["new1", "new2"]
 
 
 def test_render_chat_plain():

@@ -1,11 +1,11 @@
-"""Chat-style Pane replies with append-only history.
+"""Chat-style Pane replies with append-only history (no silent drops).
 
 Discord has no native token stream. Pattern:
   1. Reply immediately with 「思考中…」
-  2. Append new Pane lines into an in-memory turn buffer (never drop earlier lines)
-  3. Throttle-edit the live Discord message as the buffer grows
-  4. When the live message nears 2000 chars, freeze it and continue on a new
-     「（续）」 message — earlier bubbles stay in channel history
+  2. Diff each pane.read snapshot against the previous one; append every
+     inserted/replaced line into an in-memory turn buffer (never drop earlier lines)
+  3. Throttle-edit the live Discord message; on failure keep pending and retry
+  4. Near 2000 chars, freeze the bubble and continue on 「（续）」— sealed text stays
 
 Approve / Yes-No buttons remain separate (choice_ui) when a real prompt appears.
 """
@@ -13,6 +13,7 @@ Approve / Yes-No buttons remain separate (choice_ui) when a real prompt appears.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import time
 from collections.abc import Callable
@@ -34,6 +35,7 @@ MIN_EDIT_INTERVAL = 1.0
 # Discord typing indicator expires ~10s; refresh while waiting/streaming.
 TYPING_REFRESH = 8.0
 PLACEHOLDER = "思考中…"
+FLUSH_RETRY_DELAY = 1.5
 
 
 @dataclass
@@ -55,10 +57,12 @@ class _TurnState:
     live_start: int = 0
     segment_index: int = 0
     last_window: list[str] = field(default_factory=list)
+    last_snapshot: str = ""
     last_rendered: str = ""
     active: bool = False  # True after begin_prompt_session until next prompt
     choice_message_id: int | None = None
     choice_fingerprint: str | None = None
+    bridge_cfg: BridgeConfig | None = None
 
 
 _states: dict[tuple[int, str], _TurnState] = {}
@@ -128,6 +132,38 @@ def new_lines_from_window(session: list[str], window: list[str]) -> list[str]:
     return list(window[idx + 1 :])
 
 
+def window_diff_lines(prev: list[str], window: list[str]) -> list[str]:
+    """Every inserted/replaced line when the sliding window advances.
+
+    This is the primary anti-leak path: scroll, append, and in-place rewrites all
+    show up as insert/replace opcodes.
+    """
+    if not window:
+        return []
+    if not prev:
+        return list(window)
+    if prev == window:
+        return []
+    matcher = difflib.SequenceMatcher(a=prev, b=window, autojunk=False)
+    out: list[str] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in {"insert", "replace"}:
+            out.extend(window[j1:j2])
+    return out
+
+
+def _filter_duplicate_prefix(session: list[str], added: list[str]) -> list[str]:
+    if not added:
+        return []
+    if not session:
+        return list(added)
+    max_n = min(len(session), len(added))
+    for n in range(max_n, 0, -1):
+        if session[-n:] == added[:n]:
+            return list(added[n:])
+    return list(added)
+
+
 def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
     """New lines after a prompt baseline, tolerant of pane.read sliding windows."""
     if not window:
@@ -176,51 +212,44 @@ def turn_lines_since_baseline(baseline: str | None, current: str) -> list[str]:
     return list(window)
 
 
-def _inplace_last_line_update(state: _TurnState, prev: list[str], window: list[str]) -> bool:
-    """Handle spinner / in-place last-line rewrites without dropping history."""
-    if not prev or not window or len(prev) != len(window):
-        return False
-    if prev[:-1] != window[:-1] or prev[-1] == window[-1]:
-        return False
-    if state.session_lines and state.session_lines[-1] == prev[-1]:
-        state.session_lines[-1] = window[-1]
-        return True
-    if not state.session_lines:
-        state.session_lines.append(window[-1])
-        return True
-    return False
-
-
 def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
     """Append newly visible Pane lines into this turn's history.
 
-    Never replaces earlier session_lines with the current sliding window tip —
-    that was wiping Discord history down to “only the latest screen”.
+    Prefer difflib window diffs so scrolled / rewritten tips cannot silently vanish.
+    Never replaces earlier session_lines with only the current tip.
     """
-    window = str(snapshot or "").splitlines()
-    if window == state.last_window:
+    snap = str(snapshot or "")
+    window = snap.splitlines()
+    if snap == state.last_snapshot and window == state.last_window:
         return 0
     prev = list(state.last_window)
     state.last_window = list(window)
+    state.last_snapshot = snap
 
     added: list[str] = []
     if not state.session_lines:
         base = str(state.baseline_text or "").splitlines()
+        baseline_s = str(state.baseline_text or "")
+        if window == base or snap == baseline_s:
+            return 0
         added = _delta_from_baseline(base, window)
         if not added and prev:
-            added = new_lines_from_window(prev, window)
-        if not added and _inplace_last_line_update(state, prev, window):
-            return 1
-        if not added and window != base:
+            added = window_diff_lines(prev, window)
+        if not added:
             # First post-prompt snapshot lost the baseline — seed once.
-            added = turn_lines_since_baseline(state.baseline_text, snapshot)
+            added = turn_lines_since_baseline(state.baseline_text, snap)
     else:
-        added = new_lines_from_window(state.session_lines, window)
-        if not added and prev:
-            added = new_lines_from_window(prev, window)
-        if not added and _inplace_last_line_update(state, prev, window):
-            return 1
+        added = window_diff_lines(prev, window)
+        if not added:
+            added = new_lines_from_window(state.session_lines, window)
+        if not added:
+            tip = turn_lines_since_baseline(state.baseline_text, snap)
+            if tip and len(tip) > len(state.session_lines) and tip[: len(state.session_lines)] == state.session_lines:
+                added = tip[len(state.session_lines) :]
+            elif tip:
+                added = new_lines_from_window(state.session_lines, tip)
 
+    added = _filter_duplicate_prefix(state.session_lines, added)
     if not added:
         return 0
     state.session_lines.extend(added)
@@ -319,19 +348,46 @@ async def begin_prompt_session(
     remote_id: str = "",
 ) -> None:
     """Start a chat turn: reply under the user message with a streaming placeholder."""
+    from src.bot.config import BridgeConfig
+
     state = _get(thread, pane_id)
+
+    # Flush any unflushed previous-turn lines to Discord before resetting — no silent drop.
+    if state.active and state.session_lines[state.live_start :]:
+        cfg = state.bridge_cfg or BridgeConfig()
+        state.pending = True
+        try:
+            await _flush(thread, pane_id, cfg, state, clock=time.time)
+        except Exception:  # noqa: BLE001
+            log.exception("failed flushing previous turn before new prompt %s", pane_id)
+
     _cancel_task(state.flush_task)
     state.flush_task = None
     _stop_typing(state)
     state.pending = False
+
+    # Previous live bubble will not receive more edits.
+    old_id = state.message_id
+    old_rendered = state.last_rendered
+    if old_id is not None and (
+        old_rendered == PLACEHOLDER or old_rendered.endswith("\n…") or old_rendered.endswith("…")
+    ):
+        try:
+            old = await thread.fetch_message(old_id)
+            note = "（已结束，见下方新回复）" if old_rendered != PLACEHOLDER else "（已取消）"
+            if str(getattr(old, "content", "") or "") in {PLACEHOLDER, old_rendered}:
+                await old.edit(content=note)
+        except Exception:  # noqa: BLE001
+            log.debug("failed marking previous chat bubble %s", old_id, exc_info=True)
+
     state.anchor_message = prompt_message
     state.anchor_message_id = int(getattr(prompt_message, "id", 0) or 0) or None
     state.baseline_text = state.text
     state.session_lines = []
     state.live_start = 0
     state.segment_index = 0
-    # Seed so the first post-prompt push can diff against the pre-prompt tip.
     state.last_window = str(state.text or "").splitlines()
+    state.last_snapshot = str(state.text or "")
     state.last_rendered = PLACEHOLDER
     state.active = True
     state.status = "working"
@@ -339,7 +395,6 @@ async def begin_prompt_session(
     if remote_id:
         state.remote_id = remote_id
 
-    # Instant feedback: typing dots + placeholder bubble under the user message.
     await _trigger_typing(thread)
     _start_typing(thread, state)
     try:
@@ -354,7 +409,6 @@ async def begin_prompt_session(
         return
     state.message_id = int(msg.id)
     state.needs_new_message = False
-    # Allow the first content edit immediately after the placeholder.
     state.last_edit = 0.0
 
 
@@ -365,6 +419,7 @@ async def _send_new(thread: Any, state: _TurnState, content: str) -> Any:
         try:
             msg = await anchor.reply(content)
         except Exception:  # noqa: BLE001
+            log.debug("anchor.reply failed; falling back to thread.send", exc_info=True)
             msg = None
     if msg is None:
         msg = await thread.send(content)
@@ -386,6 +441,22 @@ async def _edit_live(thread: Any, state: _TurnState, content: str) -> Any:
         return await _send_new(thread, state, content)
 
 
+def _schedule_flush(
+    thread: Any,
+    pane_id: str,
+    bridge_cfg: BridgeConfig,
+    state: _TurnState,
+    delay: float,
+    clock: Callable[[], float],
+) -> None:
+    state.pending = True
+    if state.flush_task is None or state.flush_task.done():
+        state.flush_task = asyncio.create_task(
+            _flush_after(thread, pane_id, bridge_cfg, state, delay, clock),
+            name=f"chat-stream-{getattr(thread, 'id', '?')}-{pane_id}",
+        )
+
+
 async def apply_terminal_view(
     thread: Any,
     pane_id: str,
@@ -400,6 +471,7 @@ async def apply_terminal_view(
 ) -> int | None:
     """Stream Pane output into the active chat reply (no-op without an active turn)."""
     state = _get(thread, pane_id)
+    state.bridge_cfg = bridge_cfg
     if remote_id:
         state.remote_id = remote_id
     state.text = text
@@ -414,8 +486,8 @@ async def apply_terminal_view(
 
     # Chatbot mode: ignore background Pane noise until the user sends a message.
     if not state.active and not force:
-        # Keep last snapshot so the next turn's baseline is fresh; do not touch Discord.
         state.last_window = str(text or "").splitlines()
+        state.last_snapshot = str(text or "")
         state.session_lines = []
         return state.message_id
 
@@ -423,10 +495,8 @@ async def apply_terminal_view(
         state.message_id = message_id
 
     changed = absorb_gateway_window(state, text)
-    # Nothing new since the prompt — keep 「思考中…」, do not edit to "…".
     if not changed and not force:
         return state.message_id
-    # Still only the placeholder state (empty turn body).
     if not state.session_lines and not force:
         return state.message_id
 
@@ -438,13 +508,8 @@ async def apply_terminal_view(
         and not state.needs_new_message
         and (now - state.last_edit) < cooldown
     ):
-        state.pending = True
-        if state.flush_task is None or state.flush_task.done():
-            delay = cooldown - (now - state.last_edit)
-            state.flush_task = asyncio.create_task(
-                _flush_after(thread, pane_id, bridge_cfg, state, delay, clock),
-                name=f"chat-stream-{thread.id}-{pane_id}",
-            )
+        delay = cooldown - (now - state.last_edit)
+        _schedule_flush(thread, pane_id, bridge_cfg, state, delay, clock)
         return state.message_id
 
     return await _flush(thread, pane_id, bridge_cfg, state, clock=clock)
@@ -477,7 +542,7 @@ async def flush_terminal_view(
     clock: Callable[[], float] = time.time,
 ) -> int | None:
     state = _get(thread, pane_id)
-    if not state.pending:
+    if not state.pending and not state.session_lines[state.live_start :]:
         return state.message_id
     return await _flush(thread, pane_id, bridge_cfg, state, clock=clock)
 
@@ -497,7 +562,6 @@ async def _flush(
     if not state.session_lines and state.text:
         absorb_gateway_window(state, state.text)
 
-    # Still waiting for Pane output after the user prompt.
     if not state.session_lines[state.live_start :]:
         return state.message_id
 
@@ -523,7 +587,6 @@ async def _flush(
                 state.last_edit = clock()
                 return state.message_id
 
-            # Freeze a fitted prefix; continue streaming on a new reply.
             fit = _fit_prefix(live_lines, continued=continued)
             if fit >= len(live_lines):
                 fit = max(1, len(live_lines) - 1)
@@ -541,5 +604,16 @@ async def _flush(
             state.needs_new_message = True
             state.last_edit = clock()
     except discord.HTTPException as exc:
-        log.warning("chat stream update failed %s/%s: %s", state.remote_id, pane_id, exc)
+        log.warning(
+            "chat stream update failed %s/%s (will retry): %s",
+            state.remote_id,
+            pane_id,
+            exc,
+        )
+        # Keep unflushed live lines; retry so Discord does not permanently miss them.
+        _schedule_flush(thread, pane_id, bridge_cfg, state, FLUSH_RETRY_DELAY, clock)
+        return state.message_id
+    except Exception:  # noqa: BLE001
+        log.exception("chat stream update crashed %s/%s (will retry)", state.remote_id, pane_id)
+        _schedule_flush(thread, pane_id, bridge_cfg, state, FLUSH_RETRY_DELAY, clock)
         return state.message_id

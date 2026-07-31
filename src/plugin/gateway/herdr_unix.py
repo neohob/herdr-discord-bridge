@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-from src.shared.ndjson import (
+from ._lib import (
     HerdrProtocolError,
     decode_line,
     encode_line,

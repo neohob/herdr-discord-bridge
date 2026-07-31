@@ -8,14 +8,14 @@ import ssl
 from collections.abc import Callable
 from typing import Any
 
-from src.plugin.gateway.config import GatewayConfig
-from src.plugin.gateway.tls_util import load_ssl_context_server
-from src.shared.ndjson import (
+from ._lib import (
     HerdrApiError,
     HerdrProtocolError,
     decode_line,
     encode_line,
 )
+from .config import GatewayConfig
+from .tls_util import load_ssl_context_server
 
 
 class PushHub:

@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from src.shared.fingerprint import cert_sha256_fingerprint
+from ._lib import cert_sha256_fingerprint
 
 
 def generate_self_signed(

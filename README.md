@@ -51,38 +51,52 @@ readme_zh-cn.md        # Chinese documentation
 
 ## 1. Host plugin (each Herdr machine)
 
+Follows the [Herdr plugins](https://herdr.dev/docs/plugins/) contract: `herdr-plugin.toml` + argv actions, config under `HERDR_PLUGIN_CONFIG_DIR`, runtime state under `HERDR_PLUGIN_STATE_DIR`. The TLS gateway is a long-lived process started by the **`start` action** (not a `[[startup]]` hook — those must exit).
+
 ### Requirements
 
 - Herdr ≥ 0.7
 - Local `herdr.sock` (often `~/.config/herdr/herdr.sock`)
+- Python 3.11+ with `cryptography` and `PyYAML` (installed automatically on GitHub `plugin install` via `[[build]]`)
 - Firewall / Tailscale allows the listen port (default `9876`)
 
-### Install and lifecycle
+### Install
+
+**From GitHub (publish / end users):**
 
 ```bash
-# From the repo root
-herdr plugin link "$(pwd)/src/plugin"
+herdr plugin install neohob/herdr-discord-bridge/src/plugin
+# optional pin: herdr plugin install neohob/herdr-discord-bridge/src/plugin --ref main
+herdr plugin config-dir herdr-discord-bridge
+```
 
+**Local development (this repo):**
+
+```bash
+herdr plugin link "$(pwd)/src/plugin"
+```
+
+### Lifecycle
+
+```bash
 herdr plugin action invoke setup  --plugin herdr-discord-bridge
 herdr plugin action invoke start  --plugin herdr-discord-bridge
 herdr plugin action invoke status --plugin herdr-discord-bridge
 # stop / teardown likewise
 ```
 
-`setup` creates a token and self-signed cert, and prints values for Discord registration. Config usually lives under:
+`setup` creates a token and self-signed cert, and prints values for Discord registration.
 
-```text
-~/.config/herdr/plugins/config/herdr-discord-bridge/
-```
+| Path | Purpose |
+|------|---------|
+| `HERDR_PLUGIN_CONFIG_DIR` | `config.yaml`, TLS cert/key (typically `~/.config/herdr/plugins/config/herdr-discord-bridge/`) |
+| `HERDR_PLUGIN_STATE_DIR` | `gateway.pid`, `gateway.log` (typically `~/.config/herdr/plugins/state/herdr-discord-bridge/`) |
 
-Or via the control script (equivalent):
+Optional env: `GATEWAY_LISTEN_PORT` (default `9876`), `GATEWAY_PUBLIC_HOST` (host printed for Discord register), `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`.
 
-```bash
-HERDR_PLUGIN_CONFIG_DIR=~/.config/herdr/plugins/config/herdr-discord-bridge \
-  bash src/plugin/scripts/ctl.sh setup|start|stop|status
-```
+### Marketplace listing
 
-Optional env: `GATEWAY_LISTEN_PORT` (default `9876`), `GATEWAY_PUBLIC_HOST` (hint printed as the public IP).
+Add the GitHub topic **`herdr-plugin`** on this repository so it appears in the [Herdr marketplace](https://herdr.dev/docs/plugins/) index (refreshes about every 30 minutes). Install path for users: `neohob/herdr-discord-bridge/src/plugin`.
 
 ### Fields to register
 

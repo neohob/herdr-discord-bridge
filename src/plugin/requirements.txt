@@ -1,0 +1,3 @@
+# Runtime dependencies for the Discord Bridge host plugin (gateway).
+cryptography>=42
+pyyaml>=6.0

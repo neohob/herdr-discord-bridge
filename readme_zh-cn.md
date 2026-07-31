@@ -50,38 +50,51 @@ docs/                  # 设计 / ADR / CONTEXT
 
 ## 1. 主机插件（每台 Herdr 机器）
 
+遵循 [Herdr plugins](https://herdr.dev/docs/plugins/) 规范：`herdr-plugin.toml` + argv actions；配置在 `HERDR_PLUGIN_CONFIG_DIR`，运行时状态在 `HERDR_PLUGIN_STATE_DIR`。TLS Gateway 是长驻进程，用 **`start` action** 拉起（不要用 `[[startup]]`，规范要求 startup 必须退出）。
+
 ### 要求
 
 - Herdr ≥ 0.7
 - 本机存在 `herdr.sock`（常见：`~/.config/herdr/herdr.sock`）
+- Python 3.11+，依赖 `cryptography` / `PyYAML`（GitHub `plugin install` 时由 `[[build]]` 安装）
 - 防火墙 / Tailscale 放行监听端口（默认 `9876`）
 
-### 安装与启停
+### 安装
+
+**GitHub（发布 / 终端用户）：**
 
 ```bash
-# 在仓库根目录
-herdr plugin link "$(pwd)/src/plugin"
+herdr plugin install neohob/herdr-discord-bridge/src/plugin
+herdr plugin config-dir herdr-discord-bridge
+```
 
+**本地开发（本仓库）：**
+
+```bash
+herdr plugin link "$(pwd)/src/plugin"
+```
+
+### 启停
+
+```bash
 herdr plugin action invoke setup  --plugin herdr-discord-bridge
 herdr plugin action invoke start  --plugin herdr-discord-bridge
 herdr plugin action invoke status --plugin herdr-discord-bridge
 # stop / teardown 同理
 ```
 
-`setup` 会生成 token、自签证书，并打印供 Discord 注册用的信息。配置目录一般在：
+`setup` 会生成 token、自签证书，并打印供 Discord 注册用的信息。
 
-```text
-~/.config/herdr/plugins/config/herdr-discord-bridge/
-```
+| 路径 | 用途 |
+|------|------|
+| `HERDR_PLUGIN_CONFIG_DIR` | `config.yaml`、TLS 证书（通常 `~/.config/herdr/plugins/config/herdr-discord-bridge/`） |
+| `HERDR_PLUGIN_STATE_DIR` | `gateway.pid`、`gateway.log`（通常 `~/.config/herdr/plugins/state/herdr-discord-bridge/`） |
 
-也可用脚本（等价）：
+可选环境变量：`GATEWAY_LISTEN_PORT`、`GATEWAY_PUBLIC_HOST`、`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`。
 
-```bash
-HERDR_PLUGIN_CONFIG_DIR=~/.config/herdr/plugins/config/herdr-discord-bridge \
-  bash src/plugin/scripts/ctl.sh setup|start|stop|status
-```
+### 上架 Marketplace
 
-可选环境变量：`GATEWAY_LISTEN_PORT`（默认 `9876`）、`GATEWAY_PUBLIC_HOST`（打印用的对外 IP 提示）。
+给本仓库加上 GitHub topic **`herdr-plugin`**，即可进入 Herdr marketplace 索引（约 30 分钟刷新）。用户安装路径：`neohob/herdr-discord-bridge/src/plugin`。
 
 ### 注册时建议填写
 

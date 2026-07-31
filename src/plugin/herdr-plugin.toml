@@ -1,35 +1,44 @@
-# Herdr plugin manifest — Discord Bridge Gateway
+# Herdr plugin manifest — see https://herdr.dev/docs/plugins/
 id = "herdr-discord-bridge"
-name = "Discord Bridge Gateway"
+name = "Discord Bridge"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "TLS NDJSON gateway for Discord Bot ↔ Herdr bridging"
+description = "TLS NDJSON host plugin so a Discord bot can drive this Herdr over the network"
 platforms = ["linux", "macos"]
+
+# Runtime deps for GitHub `plugin install` (local `plugin link` does not run builds).
+[[build]]
+command = ["python3", "-m", "pip", "install", "--user", "-r", "requirements.txt"]
+
+# Long-lived gateway is started via the `start` action (not [[startup]]):
+# Herdr startup hooks are one-shot and must exit; they are not supervised daemons.
 
 [[actions]]
 id = "setup"
-title = "Setup Gateway"
-description = "Generate token, TLS cert, and config for Discord /herdr register"
+title = "Setup Discord bridge"
+contexts = ["workspace"]
 command = ["bash", "scripts/ctl.sh", "setup"]
 
 [[actions]]
 id = "start"
-title = "Start Gateway"
-description = "Start the TLS Gateway process"
+title = "Start Discord bridge gateway"
+contexts = ["workspace"]
 command = ["bash", "scripts/ctl.sh", "start"]
 
 [[actions]]
 id = "stop"
-title = "Stop Gateway"
+title = "Stop Discord bridge gateway"
+contexts = ["workspace"]
 command = ["bash", "scripts/ctl.sh", "stop"]
 
 [[actions]]
 id = "status"
-title = "Gateway Status"
+title = "Discord bridge status"
+contexts = ["workspace"]
 command = ["bash", "scripts/ctl.sh", "status"]
 
 [[actions]]
 id = "teardown"
-title = "Teardown Gateway"
-description = "Stop Gateway and remove generated config/certs"
+title = "Teardown Discord bridge"
+contexts = ["workspace"]
 command = ["bash", "scripts/ctl.sh", "teardown"]
