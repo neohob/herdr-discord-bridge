@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,14 @@ MIN_EDIT_INTERVAL = 1.0
 TYPING_REFRESH = 8.0
 PLACEHOLDER = "思考中…"
 FLUSH_RETRY_DELAY = 1.5
+
+# TUI spinners (braille + common unicode spinners) rewritten in-place each frame.
+_BRAILLE_RE = re.compile(r"[\u2800-\u28FF]+")
+_SPINNER_GLYPH_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]+")
+_STATUS_LINE_RE = re.compile(
+    r"^(?:Running|Working|Thinking|Waiting)\s+[\d.,]+\s*k?\s*tokens\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -164,6 +173,51 @@ def _filter_duplicate_prefix(session: list[str], added: list[str]) -> list[str]:
     return list(added)
 
 
+def _strip_spinner_glyphs(line: str) -> str:
+    text = _BRAILLE_RE.sub("", line)
+    text = _SPINNER_GLYPH_RE.sub("", text)
+    return text.strip()
+
+
+def _is_status_line(line: str) -> bool:
+    """True for agent TUI token counters like ``Running 6.7k tokens``."""
+    return bool(_STATUS_LINE_RE.match(_strip_spinner_glyphs(line)))
+
+
+def _is_prefix_rewrite(previous: str, current: str) -> bool:
+    """True when one line is a progressive rewrite of the other (typing echo)."""
+    if not previous or not current or previous == current:
+        return False
+    return current.startswith(previous) or previous.startswith(current)
+
+
+def merge_added_lines(session: list[str], added: list[str]) -> int:
+    """Merge ``added`` into ``session`` with spinner/prefix coalesce.
+
+    Returns the number of mutations (append or in-place replace). A pure replace
+    still counts so Discord can refresh the live bubble.
+    """
+    mutations = 0
+    for line in added:
+        if not session:
+            session.append(line)
+            mutations += 1
+            continue
+        last = session[-1]
+        if _is_status_line(line) and _is_status_line(last):
+            if last != line:
+                session[-1] = line
+                mutations += 1
+            continue
+        if _is_prefix_rewrite(last, line):
+            session[-1] = line
+            mutations += 1
+            continue
+        session.append(line)
+        mutations += 1
+    return mutations
+
+
 def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
     """New lines after a prompt baseline, tolerant of pane.read sliding windows."""
     if not window:
@@ -252,8 +306,7 @@ def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
     added = _filter_duplicate_prefix(state.session_lines, added)
     if not added:
         return 0
-    state.session_lines.extend(added)
-    return len(added)
+    return merge_added_lines(state.session_lines, added)
 
 
 def session_body(baseline: str | None, current: str, max_lines: int) -> str:

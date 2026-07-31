@@ -5,7 +5,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.bot.commands import _ensure_client, _map_panes, resolve_pane_from_thread, resolve_remote_from_channel
+from src.bot.commands import (
+    _ensure_client,
+    _map_panes,
+    compose_agent_payload,
+    handle_agent_command,
+    resolve_pane_from_thread,
+    resolve_remote_from_channel,
+)
 from src.bot.mapping import MappingStore, PaneMapping
 from src.bot.registry import RemoteRecord, RemoteRegistry
 
@@ -34,6 +41,62 @@ def test_resolve_pane_from_thread(tmp_path):
 
     assert resolve_pane_from_thread(20, mapping) == ("lab", "w1:p1")
     assert resolve_pane_from_thread(999, mapping) is None
+
+
+def test_compose_agent_payload_joins_optional_text() -> None:
+    assert compose_agent_payload("/grilling") == "/grilling"
+    assert compose_agent_payload("/grilling", "extra args here") == "/grilling extra args here"
+    assert compose_agent_payload("  /compact  ", "  keep going  ") == "/compact keep going"
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_rejects_non_pane_thread() -> None:
+    bot = SimpleNamespace(
+        mapping=SimpleNamespace(find_by_thread=lambda _: None),
+        runtime=SimpleNamespace(clients={}),
+    )
+    interaction = SimpleNamespace(
+        channel=SimpleNamespace(id=1, send=AsyncMock()),
+        user=SimpleNamespace(mention="<@1>"),
+        response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+    await handle_agent_command(bot, interaction, "/grilling")
+    interaction.response.send_message.assert_awaited()
+    assert "Pane thread" in interaction.response.send_message.await_args.args[0]
+    interaction.channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_forwards_in_pane_thread() -> None:
+    client = SimpleNamespace(send_input=AsyncMock())
+    bot = SimpleNamespace(
+        mapping=SimpleNamespace(
+            find_by_thread=lambda _: SimpleNamespace(remote_id="lab", pane_id="w1:p1"),
+            set_terminal_message=lambda *a, **k: None,
+        ),
+        runtime=SimpleNamespace(clients={"lab": client}),
+    )
+    reply = SimpleNamespace(id=99)
+    anchor = SimpleNamespace(id=42, reply=AsyncMock(return_value=reply))
+    channel = SimpleNamespace(id=20, send=AsyncMock(return_value=anchor), trigger_typing=AsyncMock())
+    interaction = SimpleNamespace(
+        channel=channel,
+        user=SimpleNamespace(mention="<@9>"),
+        response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await handle_agent_command(bot, interaction, "/grilling", "extra args here")
+
+    interaction.response.send_message.assert_awaited()
+    assert interaction.response.send_message.await_args.kwargs.get("ephemeral") is True
+    channel.send.assert_awaited_once()
+    assert "/grilling extra args here" in channel.send.await_args.args[0]
+    client.send_input.assert_awaited_once_with(
+        "w1:p1", "/grilling extra args here", keys=["enter"]
+    )
+    anchor.reply.assert_awaited_once()
 
 
 @pytest.mark.asyncio

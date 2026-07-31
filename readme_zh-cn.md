@@ -226,14 +226,17 @@ docker compose up -d --build
 
 | 操作 | 方式 |
 |------|------|
-| 向 Pane 发命令 | **聊天模式**：发一条 →「思考中…」；输出**只追加不删**，同条消息刷新；装满后封存再开「（续）」下一条，频道里可翻完整历史 |
+| 向 Pane 发命令 | **聊天模式**：在 Pane 线程里正常打字即可 |
+| Agent skill | 优先用斜杠 **`/agent`**：`command` 填 `/grilling` 等，可选 `text` 填后面的说明/参数 → Pane 收到整段拼接。能发出的普通消息 `/xxx …` 仍会转发 |
+| Discord 管理 | 斜杠菜单 **`/herdr …`**（不会当成 Pane 文本） |
 | Approve / 选择 | 仅在真正确认提示 / `blocked` 时出 Yes/No/Custom |
-| 看输出 | 纯文本 Bot 气泡；没有输入时不刷屏 |
-| 列表 / 读写 | `/herdr pane list\|read\|…` |
+| 看输出 | 纯文本 Bot 气泡；spinner / 打字回显噪声会合并 |
+| 列表 / 读写 | `/herdr pane list\|read\|…`（斜杠命令 UI） |
 | 状态 | `/herdr status` |
 | 换绑频道 | 在新频道 `/herdr rebind` |
 | 帮助 | `/herdr help` |
 
+**斜杠 vs Skill：** `/herdr` = 桥接管理；`/agent` = 发到当前 Pane 线程。线程里的普通消息（含 Agent 的 `/…`）在 Discord 允许当普通消息发送时仍会转发。
 斜杠命令若未出现：等 1～2 分钟或重开客户端；确认机器人在线且 `guild_id` 正确。
 
 ## 4. 常见问题

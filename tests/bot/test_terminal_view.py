@@ -8,15 +8,18 @@ import pytest
 
 from src.bot.config import BridgeConfig, TerminalConfig
 from src.bot.terminal_view import (
+    absorb_gateway_window,
     apply_terminal_view,
     begin_prompt_session,
     clear_terminal_state,
     flush_terminal_view,
     get_terminal_state,
+    merge_added_lines,
     new_lines_from_window,
     render_chat_reply,
     window_diff_lines,
 )
+from src.bot.terminal_view import _TurnState
 
 
 class FakeClock:
@@ -59,6 +62,67 @@ def test_window_diff_captures_scroll_and_inplace():
     assert window_diff_lines(["a", "b"], ["a", "b2"]) == ["b2"]
     # Full screen replace must not return empty.
     assert window_diff_lines(["old1", "old2"], ["new1", "new2"]) == ["new1", "new2"]
+
+
+def test_merge_coalesces_spinner_status_frames():
+    session: list[str] = []
+    frames = [
+        " ⠀⠞ Running  6.7k tokens",
+        " ⠘⠆ Running  6.7k tokens",
+        " ⠠⠜ Running  6.7k tokens",
+        " ⠘⠣ Running  6.7k tokens",
+        " ⠰⠳ Working  26.39k tokens",
+    ]
+    merge_added_lines(session, frames)
+    assert len(session) == 1
+    assert "Working" in session[0]
+    assert "26.39k" in session[0]
+
+
+def test_merge_coalesces_progressive_typing_echo():
+    session: list[str] = []
+    echoes = [
+        "  → 有个",
+        "  → 有个问",
+        "  → 有个问题",
+        "  → 有个问题，怎么调用skills呢？",
+        "  → 有个问题，怎么调用skills呢？因为 / 都是herdr的命令，那么s",
+        "  → 有个问题，怎么调用skills呢？因为 / 都是herdr的命令，",
+        "  → 有个问题，怎么调用skills呢？因为 / 都是herdr的命令，那么agent的很多命令也是 / 开头的",
+        "  有个问题，怎么调用skills呢？因为 / 都是herdr的命令，那么agent的很多命令也是 / 开头的",
+    ]
+    merge_added_lines(session, echoes)
+    # Prefix-related rewrites collapse; the final non-arrow line is a different stem → append.
+    assert any("开头的" in line for line in session)
+    assert len(session) <= 2
+    assert session[-1].strip().startswith("有个问题")
+
+
+def test_merge_keeps_distinct_non_prefix_lines():
+    session = ["early", "middle"]
+    merge_added_lines(session, ["late"])
+    assert session == ["early", "middle", "late"]
+    # b → b2 is a prefix rewrite and should replace, not append a third copy of history.
+    session2 = ["a", "b"]
+    merge_added_lines(session2, ["b2"])
+    assert session2 == ["a", "b2"]
+
+
+def test_absorb_coalesces_spinner_across_snapshots():
+    state = _TurnState(baseline_text="base", last_window=["base"], last_snapshot="base")
+    absorb_gateway_window(state, "base\n ⠀⠞ Running  6.7k tokens")
+    absorb_gateway_window(state, "base\n ⠘⠆ Running  6.7k tokens")
+    absorb_gateway_window(state, "base\n ⠰⠳ Working  26.39k tokens")
+    assert len(state.session_lines) == 1
+    assert "Working" in state.session_lines[0]
+
+
+def test_absorb_coalesces_typing_echo_across_snapshots():
+    state = _TurnState(baseline_text="base", last_window=["base"], last_snapshot="base")
+    absorb_gateway_window(state, "base\n  → 有个")
+    absorb_gateway_window(state, "base\n  → 有个问")
+    absorb_gateway_window(state, "base\n  → 有个问题，怎么调用skills呢？")
+    assert state.session_lines == ["  → 有个问题，怎么调用skills呢？"]
 
 
 def test_render_chat_plain():

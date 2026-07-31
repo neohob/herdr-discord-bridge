@@ -1,4 +1,4 @@
-"""The single ``/herdr`` slash-command surface."""
+"""Discord slash-command surface: ``/herdr`` (ops) and ``/agent`` (Pane input)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any, TYPE_CHECKING
 import discord
 from discord import app_commands
 
+from src.bot.chat_input import format_agent_anchor, forward_pane_input
 from src.bot.discord_map import ensure_pane_thread, ensure_remote_channel
 from src.bot.herdr.models import PaneInfo, extract_list
 from src.bot.mapping import MappingStore
@@ -209,11 +210,88 @@ class _RebindView(discord.ui.View):
         self.add_item(_RebindSelect(remotes, bind))
 
 
+def compose_agent_payload(command: str, text: str | None = None) -> str:
+    """Join ``/agent`` command + optional trailing text for Pane send."""
+    head = str(command or "").strip()
+    tail = str(text or "").strip()
+    if head and tail:
+        return f"{head} {tail}"
+    return head or tail
+
+
+async def handle_agent_command(
+    bot: BridgeBot,
+    interaction: discord.Interaction[Any],
+    command: str,
+    text: str | None = None,
+) -> None:
+    """``/agent``: forward command (+ optional trailing text) into the Pane thread."""
+    payload = compose_agent_payload(command, text)
+    if not payload:
+        await _respond(interaction, "command must not be empty.", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    thread_id = getattr(channel, "id", None)
+    pane = bot.mapping.find_by_thread(thread_id)
+    if pane is None:
+        await _respond(
+            interaction,
+            "Run `/agent` inside a mapped Pane thread.",
+            ephemeral=True,
+        )
+        return
+
+    runtime = getattr(bot, "runtime", None)
+    client = runtime.clients.get(pane.remote_id) if runtime is not None else None
+    if client is None:
+        await _respond(
+            interaction,
+            f"Remote `{pane.remote_id}` is offline.",
+            ephemeral=True,
+        )
+        return
+
+    # Ack Discord's 3s interaction deadline before slower Pane work.
+    await _respond(interaction, "已发送", ephemeral=True)
+
+    try:
+        anchor = await channel.send(format_agent_anchor(interaction.user, payload))
+    except Exception as exc:  # noqa: BLE001
+        await _respond(interaction, f"Could not post anchor message: {exc}", ephemeral=True)
+        return
+
+    ok = await forward_pane_input(bot, channel, pane, payload, anchor)
+    if not ok:
+        await _respond(
+            interaction,
+            f"Failed to send to `{pane.remote_id}:{pane.pane_id}`.",
+            ephemeral=True,
+        )
+
+
 def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
-    """Register one top-level ``/herdr`` command and all its subcommands."""
+    """Register top-level ``/herdr`` and ``/agent`` slash commands."""
     root = app_commands.Group(name="herdr", description="Manage Herdr Remotes and Panes")
     pane_group = app_commands.Group(name="pane", description="Pane operations", parent=root)
     workspace_group = app_commands.Group(name="workspace", description="Workspace operations", parent=root)
+
+    @tree.command(name="agent", description="Send an agent skill/text into this Pane thread")
+    @app_commands.describe(
+        command="Skill or first token, e.g. /grilling or /compact (forwarded as-is)",
+        text="Optional extra text after the skill (appended with a space)",
+    )
+    async def agent_command(
+        interaction: discord.Interaction[Any],
+        command: app_commands.Range[str, 1, 6000],
+        text: app_commands.Range[str, 1, 6000] | None = None,
+    ) -> None:
+        await handle_agent_command(
+            bot,
+            interaction,
+            str(command),
+            None if text is None else str(text),
+        )
 
     async def bind(interaction: discord.Interaction[Any], remote_id: str) -> None:
         if not await _require_operator(bot, interaction):
@@ -464,8 +542,9 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
         await _respond(
             interaction,
             "Use `/herdr register`, `rebind`, `status`, `sync`, `/herdr pane …`, "
-            "or `/herdr workspace …`. Run structural operations in the Remote Channel "
-            "or Pane Thread to use its context.",
+            "or `/herdr workspace …`. In a Pane thread, `/agent` with `command` "
+            "(e.g. `/grilling`) and optional `text` forwards the joined line to the Pane. "
+            "Run structural operations in the Remote Channel or Pane Thread to use its context.",
             ephemeral=True,
         )
 
