@@ -231,6 +231,7 @@ Builds or renames threads from live Herdr `workspace.list` / `tab.list` / `pane.
 |--------|-----|
 | Send to a Pane | **Chat mode:** type normally in the Pane thread. Output streams under your message. |
 | Agent skills | Prefer slash **`/agent`**: `command` = `/grilling` (etc.), optional `text` = trailing content → Pane receives `command` + `text`. Plain-message `/xxx …` still forwards if you can send it. |
+| Stop current task | Slash **`/stop`** in the Pane thread (sends Esc, then Ctrl+C fallback) |
 | Discord ops | Slash menu **`/herdr …`** (not forwarded as pane text) |
 | Approve / choose | Yes/No/Custom only on real confirm prompts / `blocked` |
 | Read output | Plain-text bot bubbles; spinner/typing-echo noise is coalesced |
@@ -239,7 +240,7 @@ Builds or renames threads from live Herdr `workspace.list` / `tab.list` / `pane.
 | Rebind channel | `/herdr rebind` in the new channel |
 | Help | `/herdr help` |
 
-**Slash vs skills:** `/herdr` = bridge ops; `/agent` = send into the current Pane thread. Normal thread messages (including `/…` for the agent) still forward when Discord lets you send them as plain text.
+**Slash vs skills:** `/herdr` = bridge ops; `/agent` = send into the current Pane thread; `/stop` = interrupt the current turn. Normal thread messages (including `/…` for the agent) still forward when Discord lets you send them as plain text.
 If slash commands are missing: wait 1–2 minutes or restart the client; confirm the bot is online and `guild_id` is correct.
 
 ## 4. Troubleshooting

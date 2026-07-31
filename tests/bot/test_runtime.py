@@ -165,15 +165,15 @@ async def test_runtime_starts_bound_remote_routes_pushes_and_restores_observe(tm
     monkeypatch.setattr("src.bot.runtime.ensure_pane_thread", fake_ensure)
     await client.on_event(
         {
-            "event": "pane.created",
-            "data": {"pane_id": "w1:p2", "workspace_id": "w1", "label": "new"},
+            "event": "pane_created",  # Herdr underscore form
+            "data": {"pane": {"pane_id": "w1:p2", "workspace_id": "w1", "label": "new"}},
         }
     )
     assert mapping.get_pane("lab", "w1:p2") is not None
     assert ("w1:p2", True) in client.observed
     assert channel.messages[-1] == "Pane `w1:p2` created — thread ready."
 
-    await client.on_event({"event": "pane.closed", "data": {"pane_id": "w1:p1"}})
+    await client.on_event({"event": "pane_closed", "data": {"pane_id": "w1:p1"}})
     assert mapping.get_pane("lab", "w1:p1") is None
     assert thread.deleted is True
     assert ("w1:p1", False) in client.observed

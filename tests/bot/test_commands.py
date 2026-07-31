@@ -10,6 +10,7 @@ from src.bot.commands import (
     _map_panes,
     compose_agent_payload,
     handle_agent_command,
+    handle_stop_command,
     resolve_pane_from_thread,
     resolve_remote_from_channel,
 )
@@ -65,6 +66,55 @@ async def test_handle_agent_rejects_non_pane_thread() -> None:
     interaction.response.send_message.assert_awaited()
     assert "Pane thread" in interaction.response.send_message.await_args.args[0]
     interaction.channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_stop_rejects_non_pane_thread() -> None:
+    bot = SimpleNamespace(
+        mapping=SimpleNamespace(find_by_thread=lambda _: None),
+        runtime=SimpleNamespace(clients={}),
+    )
+    interaction = SimpleNamespace(
+        channel=SimpleNamespace(id=1, send=AsyncMock()),
+        user=SimpleNamespace(mention="<@1>"),
+        response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+    await handle_stop_command(bot, interaction)
+    interaction.response.send_message.assert_awaited()
+    assert "Pane thread" in interaction.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_stop_sends_interrupt() -> None:
+    client = SimpleNamespace(send_interrupt=AsyncMock())
+    bot = SimpleNamespace(
+        mapping=SimpleNamespace(
+            find_by_thread=lambda _: SimpleNamespace(remote_id="lab", pane_id="w1:p1"),
+        ),
+        runtime=SimpleNamespace(clients={"lab": client}),
+    )
+    channel = SimpleNamespace(id=20, send=AsyncMock())
+    # First respond uses response; later uses followup after is_done flips.
+    done = {"v": False}
+
+    async def send_message(*_a, **_k):
+        done["v"] = True
+
+    interaction = SimpleNamespace(
+        channel=channel,
+        user=SimpleNamespace(mention="<@9>"),
+        response=SimpleNamespace(is_done=lambda: done["v"], send_message=AsyncMock(side_effect=send_message)),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await handle_stop_command(bot, interaction)
+
+    client.send_interrupt.assert_awaited_once_with("w1:p1")
+    channel.send.assert_awaited()
+    assert "/stop" in channel.send.await_args.args[0]
+    interaction.followup.send.assert_awaited()
+    assert "interrupt" in interaction.followup.send.await_args.args[0].lower()
 
 
 @pytest.mark.asyncio

@@ -298,8 +298,59 @@ async def handle_agent_command(
         )
 
 
+async def handle_stop_command(
+    bot: BridgeBot,
+    interaction: discord.Interaction[Any],
+) -> None:
+    """``/stop``: interrupt the current task in this Pane thread."""
+    channel = interaction.channel
+    thread_id = getattr(channel, "id", None)
+    pane = bot.mapping.find_by_thread(thread_id)
+    if pane is None:
+        await _respond(
+            interaction,
+            "Run `/stop` inside a mapped Pane thread.",
+            ephemeral=True,
+        )
+        return
+
+    runtime = getattr(bot, "runtime", None)
+    client = runtime.clients.get(pane.remote_id) if runtime is not None else None
+    if client is None:
+        await _respond(
+            interaction,
+            f"Remote `{pane.remote_id}` is offline.",
+            ephemeral=True,
+        )
+        return
+
+    await _respond(interaction, "正在终止…", ephemeral=True)
+
+    user = interaction.user
+    mention = getattr(user, "mention", None) or str(getattr(user, "id", "user"))
+    try:
+        await channel.send(f"{mention}: `/stop` — interrupt `{pane.remote_id}:{pane.pane_id}`")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        await client.send_interrupt(pane.pane_id)
+    except Exception as exc:  # noqa: BLE001
+        await _respond(
+            interaction,
+            f"Stop failed for `{pane.remote_id}:{pane.pane_id}`: {exc}",
+            ephemeral=True,
+        )
+        return
+    await _respond(
+        interaction,
+        f"Sent interrupt to `{pane.remote_id}:{pane.pane_id}`.",
+        ephemeral=True,
+    )
+
+
 def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
-    """Register top-level ``/herdr`` and ``/agent`` slash commands."""
+    """Register top-level ``/herdr``, ``/agent``, and ``/stop`` slash commands."""
     root = app_commands.Group(name="herdr", description="Manage Herdr Remotes and Panes")
     pane_group = app_commands.Group(name="pane", description="Pane operations", parent=root)
     workspace_group = app_commands.Group(name="workspace", description="Workspace operations", parent=root)
@@ -320,6 +371,10 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             str(command),
             None if text is None else str(text),
         )
+
+    @tree.command(name="stop", description="Interrupt the current task in this Pane thread")
+    async def stop_command(interaction: discord.Interaction[Any]) -> None:
+        await handle_stop_command(bot, interaction)
 
     async def bind(interaction: discord.Interaction[Any], remote_id: str) -> None:
         if not await _require_operator(bot, interaction):
@@ -580,8 +635,8 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
         await _respond(
             interaction,
             "Use `/herdr register`, `rebind`, `status`, `sync`, `/herdr pane …`, "
-            "or `/herdr workspace …`. In a Pane thread, `/agent` with `command` "
-            "(e.g. `/grilling`) and optional `text` forwards the joined line to the Pane. "
+            "or `/herdr workspace …`. In a Pane thread: `/agent` sends skills/text; "
+            "`/stop` interrupts the current task (Esc / Ctrl+C). "
             "Run structural operations in the Remote Channel or Pane Thread to use its context.",
             ephemeral=True,
         )

@@ -17,6 +17,7 @@ DEFAULT_SUBSCRIPTIONS: list[dict[str, str]] = [
     {"type": "pane.created"},
     {"type": "pane.closed"},
     {"type": "pane.exited"},
+    {"type": "pane.moved"},
     {"type": "pane.agent_status_changed"},
 ]
 

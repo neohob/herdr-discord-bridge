@@ -113,7 +113,7 @@ class Runtime:
 
     async def handle_push(self, remote_id: str, event: dict[str, Any]) -> None:
         """Route a Gateway push envelope for ``remote_id``."""
-        event_name = str(event.get("event") or "")
+        event_name = _normalize_event_name(str(event.get("event") or ""))
         data = event.get("data")
         if not isinstance(data, dict):
             data = {}
@@ -122,8 +122,10 @@ class Runtime:
             await self._handle_terminal_output(remote_id, data)
         elif event_name == "pane.agent_status_changed":
             await self._handle_status_change(remote_id, data)
-        elif event_name in {"pane.created", "pane.closed"}:
+        elif event_name in {"pane.created", "pane.closed", "pane.exited"}:
             await self._handle_lifecycle(remote_id, event_name, data)
+        elif event_name == "pane.moved":
+            await self._handle_pane_moved(remote_id, data)
         else:
             log.debug("ignored Gateway event %s for %s", event_name, remote_id)
 
@@ -260,14 +262,14 @@ class Runtime:
         pane_id = _pane_id(data) or "unknown"
         client = self.clients.get(remote_id)
 
-        if event_name == "pane.closed":
+        if event_name in {"pane.closed", "pane.exited"}:
             await retire_mapped_pane(
                 guild=self.guild,
                 mapping=self.mapping,
                 client=client,
                 remote_id=remote_id,
                 pane_id=pane_id,
-                reason=f"Herdr pane {pane_id} closed",
+                reason=f"Herdr pane {pane_id} {event_name.split('.')[-1]}",
             )
             note = f"Pane `{pane_id}` closed — Discord thread retired."
         else:
@@ -284,6 +286,25 @@ class Runtime:
             except discord.HTTPException:
                 log.exception("failed sending lifecycle notification for %s", remote_id)
 
+    async def _handle_pane_moved(self, remote_id: str, data: dict[str, Any]) -> None:
+        """Retire the old Pane id and map the destination after a Herdr move."""
+        previous = str(data.get("previous_pane_id") or "")
+        client = self.clients.get(remote_id)
+        if previous:
+            await retire_mapped_pane(
+                guild=self.guild,
+                mapping=self.mapping,
+                client=client,
+                remote_id=remote_id,
+                pane_id=previous,
+                reason=f"Herdr pane moved away from {previous}",
+            )
+        remote = self.registry.get(remote_id)
+        if remote is None or remote.channel_id is None:
+            return
+        channel = await self._fetch_channel(remote.channel_id)
+        await self._auto_map_created_pane(remote_id, remote, channel, data)
+
     async def _auto_map_created_pane(
         self,
         remote_id: str,
@@ -294,7 +315,22 @@ class Runtime:
         """Create/bind a Discord thread for a newly created Herdr Pane."""
         if self.config.bridge.read_only or channel is None:
             return False
-        pane = PaneInfo.from_dict(data)
+        pane = PaneInfo.from_dict(_pane_payload(data))
+        if not pane.pane_id:
+            # Some pushes only carry pane_id; enrich from live pane.get.
+            pane_id = _pane_id(data)
+            if not pane_id:
+                return False
+            client = self.clients.get(remote_id)
+            if client is not None:
+                try:
+                    details = await client.request("pane.get", {"pane_id": pane_id})
+                    if isinstance(details, dict):
+                        pane = PaneInfo.from_dict(_pane_payload(details))
+                except Exception:  # noqa: BLE001
+                    pane = PaneInfo(pane_id=pane_id, workspace_id="")
+            else:
+                pane = PaneInfo(pane_id=pane_id, workspace_id="")
         if not pane.pane_id:
             return False
         try:
@@ -346,11 +382,44 @@ class Runtime:
             log.exception("failed sending pane notification")
 
 
-def _pane_id(data: dict[str, Any]) -> str:
+_EVENT_NAME_ALIASES = {
+    "pane_created": "pane.created",
+    "pane_closed": "pane.closed",
+    "pane_exited": "pane.exited",
+    "pane_moved": "pane.moved",
+    "pane_updated": "pane.updated",
+    "pane_focused": "pane.focused",
+    "pane_agent_status_changed": "pane.agent_status_changed",
+    "pane_agent_detected": "pane.agent_detected",
+    "workspace_created": "workspace.created",
+    "workspace_closed": "workspace.closed",
+}
+
+
+def _normalize_event_name(name: str) -> str:
+    """Herdr may emit ``pane_created`` while we subscribe as ``pane.created``."""
+    text = (name or "").strip()
+    if not text or "." in text:
+        return text
+    return _EVENT_NAME_ALIASES.get(text, text)
+
+
+def _pane_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Flatten nested ``{pane: {...}}`` event payloads for ``PaneInfo.from_dict``."""
     pane = data.get("pane")
     if isinstance(pane, dict):
-        return str(data.get("pane_id") or pane.get("pane_id") or pane.get("id") or "")
-    return str(data.get("pane_id") or data.get("id") or "")
+        merged = dict(pane)
+        for key, value in data.items():
+            if key == "pane":
+                continue
+            merged.setdefault(key, value)
+        return merged
+    return data
+
+
+def _pane_id(data: dict[str, Any]) -> str:
+    payload = _pane_payload(data)
+    return str(payload.get("pane_id") or payload.get("id") or "")
 
 
 def _is_thread_like(value: Any) -> bool:

@@ -154,6 +154,32 @@ class GatewayClient:
             )
         return result
 
+    async def send_interrupt(self, pane_id: str) -> Any:
+        """Cancel the current agent/shell turn in a Pane.
+
+        Prefers ``agent.send_keys`` (``esc``) when an agent owns the pane; falls
+        back to raw ``pane.send_keys`` with ``esc`` then ``ctrl+c``.
+        """
+        try:
+            return await self.request(
+                "agent.send_keys",
+                {"target": pane_id, "keys": ["esc"]},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        result = await self.request(
+            "pane.send_keys",
+            {"pane_id": pane_id, "keys": ["esc"]},
+        )
+        try:
+            result = await self.request(
+                "pane.send_keys",
+                {"pane_id": pane_id, "keys": ["ctrl+c"]},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+
     def _mark_control_lost(self) -> None:
         self._control_ready.clear()
         self._control_lost.set()
