@@ -94,8 +94,8 @@ async def test_forward_pane_input_shared_path() -> None:
         runtime=SimpleNamespace(clients={"lab": client}),
     )
     pane = SimpleNamespace(remote_id="lab", pane_id="w1:p1")
-    reply = SimpleNamespace(id=99)
-    channel = SimpleNamespace(id=20, trigger_typing=AsyncMock())
+    reply = SimpleNamespace(id=99, edit=AsyncMock())
+    channel = SimpleNamespace(id=20, trigger_typing=AsyncMock(), fetch_message=AsyncMock(return_value=reply))
     anchor = SimpleNamespace(id=42, reply=AsyncMock(return_value=reply))
 
     ok = await forward_pane_input(bot, channel, pane, "/grilling", anchor)
@@ -104,6 +104,31 @@ async def test_forward_pane_input_shared_path() -> None:
     channel.trigger_typing.assert_awaited()
     anchor.reply.assert_awaited_once()
     client.send_input.assert_awaited_once_with("w1:p1", "/grilling", keys=["enter"])
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_input_replaces_thinking_on_send_failure() -> None:
+    client = SimpleNamespace(send_input=AsyncMock(side_effect=RuntimeError("pane_not_found: pane wH:p1 not found")))
+    bot = SimpleNamespace(
+        mapping=SimpleNamespace(set_terminal_message=lambda *a, **k: None),
+        runtime=SimpleNamespace(clients={"lab": client}),
+    )
+    pane = SimpleNamespace(remote_id="lab", pane_id="wH:p1")
+    reply = SimpleNamespace(id=99, edit=AsyncMock(), content="思考中…")
+    channel = SimpleNamespace(
+        id=20,
+        trigger_typing=AsyncMock(),
+        fetch_message=AsyncMock(return_value=reply),
+    )
+    anchor = SimpleNamespace(id=42, reply=AsyncMock(return_value=reply))
+
+    ok = await forward_pane_input(bot, channel, pane, "hello", anchor)
+
+    assert ok is False
+    reply.edit.assert_awaited()
+    edited = reply.edit.await_args.kwargs.get("content") or reply.edit.await_args.args[0]
+    assert "未能发送" in edited
+    assert "wH:p1" in edited
 
 
 def test_format_agent_anchor_includes_mention_and_text() -> None:

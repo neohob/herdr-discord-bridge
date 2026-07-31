@@ -39,7 +39,8 @@ src/
   shared/              # NDJSON / TLS 指纹等共用逻辑
 docker/
   gateway-entrypoint.sh
-  unraid-herdr-gateway.xml   # Unraid DockerMan 模板（主机插件镜像，可选）
+  unraid-herdr-discord-bridge.xml  # Unraid DockerMan 模板（Discord 机器人）
+  unraid-herdr-gateway.xml         # 可选：仅在本机有 herdr.sock 时才部署主机插件镜像
 Dockerfile             # 机器人镜像
 Dockerfile.gateway     # 主机插件镜像（可选，无 Herdr 的机器勿单独用）
 docker-compose.yml     # 通用机器人 Compose

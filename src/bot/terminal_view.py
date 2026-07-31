@@ -532,6 +532,28 @@ async def begin_prompt_session(
     state.last_edit = 0.0
 
 
+async def fail_prompt_session(thread: Any, pane_id: str, note: str) -> None:
+    """Replace the live 「思考中…」 bubble with an error and end the turn."""
+    state = _get(thread, pane_id)
+    _cancel_task(state.flush_task)
+    state.flush_task = None
+    _stop_typing(state)
+    state.pending = False
+    state.active = False
+    mid = state.message_id
+    if mid is None:
+        return
+    content = str(note or "").strip() or "❌ 发送失败"
+    if len(content) > MSG_LIMIT:
+        content = content[: MSG_LIMIT - 1] + "…"
+    try:
+        msg = await thread.fetch_message(mid)
+        await msg.edit(content=content)
+        state.last_rendered = content
+    except Exception:  # noqa: BLE001
+        log.debug("failed editing failed-prompt bubble %s", mid, exc_info=True)
+
+
 async def _send_new(thread: Any, state: _TurnState, content: str) -> Any:
     msg: Any = None
     anchor = state.anchor_message

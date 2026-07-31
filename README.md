@@ -39,7 +39,8 @@ src/
   shared/              # Shared NDJSON / TLS fingerprint helpers
 docker/
   gateway-entrypoint.sh
-  unraid-herdr-gateway.xml   # Optional Unraid DockerMan template (host plugin image)
+  unraid-herdr-discord-bridge.xml  # Unraid DockerMan template (Discord bot)
+  unraid-herdr-gateway.xml         # Optional: host-plugin image ONLY on a machine that has herdr.sock
 Dockerfile             # Bot image
 Dockerfile.gateway     # Host plugin image (optional; do not run alone without Herdr)
 docker-compose.yml     # Generic bot Compose

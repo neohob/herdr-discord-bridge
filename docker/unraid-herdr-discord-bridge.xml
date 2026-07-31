@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>herdr-discord-bridge</Name>
+  <Repository>herdr-discord-bridge:local</Repository>
+  <Registry/>
+  <Network>container:Tailscale-Docker</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/neohob/herdr-discord-bridge</Support>
+  <Project>https://github.com/neohob/herdr-discord-bridge</Project>
+  <ReadMe>https://github.com/neohob/herdr-discord-bridge#readme</ReadMe>
+  <Overview>Discord bot for Herdr Discord Bridge. Shares the Tailscale-Docker network so it can reach host-plugin gateways on Tailscale IPs. Build image locally: docker build -t herdr-discord-bridge:local -f Dockerfile .</Overview>
+  <Category>Tools: Network:Other</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon>https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/discord.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Tailscale-Docker must be running first (network_mode container:Tailscale-Docker).</Requires>
+  <Config Name="Config" Target="/app/config.yaml" Default="/mnt/user/appdata/herdr-discord-bridge/config.yaml" Mode="ro" Description="Bot config.yaml" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/herdr-discord-bridge/config.yaml</Config>
+  <Config Name="Env file" Target="/app/.env" Default="/mnt/user/appdata/herdr-discord-bridge/.env" Mode="ro" Description="Optional .env (DISCORD_TOKEN if not set below)" Type="Path" Display="always" Required="false" Mask="false">/mnt/user/appdata/herdr-discord-bridge/.env</Config>
+  <Config Name="Cache" Target="/app/cache" Default="/mnt/user/appdata/herdr-discord-bridge/cache" Mode="rw" Description="Registry + mapping cache" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/herdr-discord-bridge/cache</Config>
+  <Config Name="Logs" Target="/app/logs" Default="/mnt/user/appdata/herdr-discord-bridge/logs" Mode="rw" Description="Bot logs" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/herdr-discord-bridge/logs</Config>
+  <Config Name="DISCORD_TOKEN" Target="DISCORD_TOKEN" Default="" Mode="" Description="Discord bot token (or rely on config.yaml ${DISCORD_TOKEN} + this env)" Type="Variable" Display="always" Required="true" Mask="true"></Config>
+  <Config Name="BRIDGE_CONFIG" Target="BRIDGE_CONFIG" Default="/app/config.yaml" Mode="" Description="Config path inside container" Type="Variable" Display="advanced" Required="false" Mask="false">/app/config.yaml</Config>
+  <Config Name="LOG_LEVEL" Target="LOG_LEVEL" Default="info" Mode="" Description="Log level" Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
+  <Config Name="TZ" Target="TZ" Default="Asia/Shanghai" Mode="" Description="Timezone" Type="Variable" Display="advanced" Required="false" Mask="false">Asia/Shanghai</Config>
+  <Config Name="HOST_OS" Target="HOST_OS" Default="Unraid" Mode="" Description="Host OS" Type="Variable" Display="advanced" Required="false" Mask="false">Unraid</Config>
+  <Config Name="HOST_HOSTNAME" Target="HOST_HOSTNAME" Default="Tower" Mode="" Description="Host hostname" Type="Variable" Display="advanced" Required="false" Mask="false">Tower</Config>
+  <Config Name="HOST_CONTAINERNAME" Target="HOST_CONTAINERNAME" Default="herdr-discord-bridge" Mode="" Description="Container name" Type="Variable" Display="advanced" Required="false" Mask="false">herdr-discord-bridge</Config>
+  <TailscaleStateDir/>
+</Container>

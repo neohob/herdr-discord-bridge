@@ -14,6 +14,7 @@ from src.bot.discord_map import ensure_pane_thread, ensure_remote_channel
 from src.bot.herdr.models import PaneInfo, extract_list
 from src.bot.mapping import MappingStore
 from src.bot.operators import is_operator
+from src.bot.pane_lifecycle import retire_mapped_pane
 from src.bot.registry import RemoteRecord, RemoteRegistry
 
 if TYPE_CHECKING:
@@ -147,6 +148,33 @@ async def _tab_labels(client: Any) -> dict[str, str]:
         if tab_id and label:
             labels[tab_id] = label
     return labels
+
+
+async def _prune_stale_panes(
+    *,
+    bot: BridgeBot,
+    remote: RemoteRecord,
+    live_pane_ids: set[str],
+    guild: discord.Guild | None,
+) -> int:
+    """Archive/delete Discord threads for Pane ids that no longer exist on Herdr."""
+    pruned = 0
+    runtime = getattr(bot, "runtime", None)
+    client = runtime.clients.get(remote.id) if runtime is not None else None
+    for pane in list(bot.mapping.all_panes(remote.id)):
+        if pane.pane_id in live_pane_ids:
+            continue
+        retired = await retire_mapped_pane(
+            guild=guild,
+            mapping=bot.mapping,
+            client=client,
+            remote_id=remote.id,
+            pane_id=pane.pane_id,
+            reason=f"Herdr pane {pane.pane_id} no longer exists",
+        )
+        if retired is not None:
+            pruned += 1
+    return pruned
 
 
 async def _map_panes(
@@ -427,8 +455,22 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             client = await _ensure_client(bot, remote.id)
             result = await client.request("pane.list")
             panes = extract_list(result, "panes", "items")
+            live_ids = {
+                str(item.get("pane_id") or item.get("id") or "")
+                for item in panes
+                if item.get("pane_id") or item.get("id")
+            }
+            pruned = await _prune_stale_panes(
+                bot=bot,
+                remote=remote,
+                live_pane_ids=live_ids,
+                guild=interaction.guild,
+            )
             count = await _map_panes(interaction=interaction, bot=bot, remote=remote, panes=panes)
-            await _respond(interaction, f"Synced {count} Pane(s) for `{remote.id}`.", ephemeral=True)
+            msg = f"Synced {count} Pane(s) for `{remote.id}`."
+            if pruned:
+                msg += f" Pruned {pruned} stale thread(s)."
+            await _respond(interaction, msg, ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Sync failed: {exc}", ephemeral=True)
 
@@ -478,18 +520,14 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
         try:
             client = await _ensure_client(bot, remote_id)
             await client.request("pane.close", {"pane_id": target})
-            await client.observe_pane(target, False)
-            pane = bot.mapping.get_pane(remote_id, target)
-            if pane and interaction.guild:
-                thread = interaction.guild.get_thread(pane.thread_id)
-                if thread is None:
-                    thread = await interaction.guild.fetch_channel(pane.thread_id)
-                if isinstance(thread, discord.Thread):
-                    try:
-                        await thread.delete(reason=f"Herdr pane {target} closed")
-                    except discord.HTTPException:
-                        await thread.edit(archived=True, reason=f"Herdr pane {target} closed")
-            bot.mapping.remove_pane(remote_id, target)
+            await retire_mapped_pane(
+                guild=interaction.guild,
+                mapping=bot.mapping,
+                client=client,
+                remote_id=remote_id,
+                pane_id=target,
+                reason=f"Herdr pane {target} closed",
+            )
             await _respond(interaction, f"Closed Pane `{target}`.", ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Pane close failed: {exc}", ephemeral=True)

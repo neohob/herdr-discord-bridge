@@ -11,10 +11,11 @@ import discord
 from src.bot.choice_detect import choice_fingerprint, is_blocked_status
 from src.bot.choice_ui import clear_choice_message, ensure_choice_message
 from src.bot.config import AppConfig
-from src.bot.discord_map import thread_name_for
+from src.bot.discord_map import ensure_pane_thread, thread_name_for
 from src.bot.gateway_client import GatewayClient
 from src.bot.herdr.models import PaneInfo
 from src.bot.mapping import MappingStore, PaneMapping
+from src.bot.pane_lifecycle import is_pane_missing_error, retire_mapped_pane
 from src.bot.registry import RemoteRecord, RemoteRegistry
 from src.bot.terminal_view import apply_terminal_view, get_terminal_state
 
@@ -122,7 +123,7 @@ class Runtime:
         elif event_name == "pane.agent_status_changed":
             await self._handle_status_change(remote_id, data)
         elif event_name in {"pane.created", "pane.closed"}:
-            await self._notify_lifecycle(remote_id, event_name, data)
+            await self._handle_lifecycle(remote_id, event_name, data)
         else:
             log.debug("ignored Gateway event %s for %s", event_name, remote_id)
 
@@ -131,10 +132,21 @@ class Runtime:
         client = self.clients.get(remote_id)
         if client is None:
             return
-        for pane in self.mapping.all_panes(remote_id):
+        for pane in list(self.mapping.all_panes(remote_id)):
             try:
                 await client.observe_pane(pane.pane_id, True)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                if is_pane_missing_error(exc):
+                    await retire_mapped_pane(
+                        guild=self.guild,
+                        mapping=self.mapping,
+                        client=client,
+                        remote_id=remote_id,
+                        pane_id=pane.pane_id,
+                        reason=f"Herdr pane {pane.pane_id} not found on reconnect",
+                    )
+                    log.info("retired stale mapping %s:%s after observe failed", remote_id, pane.pane_id)
+                    continue
                 log.exception("failed re-enabling observe for %s:%s", remote_id, pane.pane_id)
 
     async def _handle_terminal_output(self, remote_id: str, data: dict[str, Any]) -> None:
@@ -235,7 +247,7 @@ class Runtime:
             ),
         )
 
-    async def _notify_lifecycle(
+    async def _handle_lifecycle(
         self,
         remote_id: str,
         event_name: str,
@@ -245,14 +257,61 @@ class Runtime:
         if remote is None or remote.channel_id is None:
             return
         channel = await self._fetch_channel(remote.channel_id)
-        if not isinstance(channel, discord.abc.Messageable) and not hasattr(channel, "send"):
-            return
         pane_id = _pane_id(data) or "unknown"
-        action = "created" if event_name == "pane.created" else "closed"
+        client = self.clients.get(remote_id)
+
+        if event_name == "pane.closed":
+            await retire_mapped_pane(
+                guild=self.guild,
+                mapping=self.mapping,
+                client=client,
+                remote_id=remote_id,
+                pane_id=pane_id,
+                reason=f"Herdr pane {pane_id} closed",
+            )
+            note = f"Pane `{pane_id}` closed — Discord thread retired."
+        else:
+            mapped = await self._auto_map_created_pane(remote_id, remote, channel, data)
+            note = (
+                f"Pane `{pane_id}` created — thread ready."
+                if mapped
+                else f"Pane `{pane_id}` created. Run `/herdr sync` if no thread appeared."
+            )
+
+        if channel is not None and hasattr(channel, "send"):
+            try:
+                await channel.send(note)
+            except discord.HTTPException:
+                log.exception("failed sending lifecycle notification for %s", remote_id)
+
+    async def _auto_map_created_pane(
+        self,
+        remote_id: str,
+        remote: RemoteRecord,
+        channel: Any,
+        data: dict[str, Any],
+    ) -> bool:
+        """Create/bind a Discord thread for a newly created Herdr Pane."""
+        if self.config.bridge.read_only or channel is None:
+            return False
+        pane = PaneInfo.from_dict(data)
+        if not pane.pane_id:
+            return False
         try:
-            await channel.send(f"Pane `{pane_id}` {action}. Use Sync/create to manage its thread.")
-        except discord.HTTPException:
-            log.exception("failed sending lifecycle notification for %s", remote_id)
+            await ensure_pane_thread(
+                channel,
+                pane,
+                remote_id=remote_id,
+                mapping=self.mapping,
+                bridge_cfg=self.config.bridge,
+            )
+            client = self.clients.get(remote_id)
+            if client is not None:
+                await client.observe_pane(pane.pane_id, True)
+            return True
+        except Exception:  # noqa: BLE001
+            log.exception("failed auto-mapping created pane %s:%s", remote_id, pane.pane_id)
+            return False
 
     async def _fetch_thread(self, thread_id: int) -> discord.Thread | Any | None:
         thread = self.guild.get_thread(thread_id)

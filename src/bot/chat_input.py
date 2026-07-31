@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from src.bot.choice_ui import clear_choice_message
-from src.bot.terminal_view import begin_prompt_session
+from src.bot.terminal_view import begin_prompt_session, fail_prompt_session
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,13 @@ async def forward_pane_input(
     client = runtime.clients.get(pane.remote_id) if runtime is not None else None
     if client is None:
         log.warning("ignoring input for offline remote %s", pane.remote_id)
+        # Still post a bubble so the user sees why nothing happened.
+        await begin_prompt_session(channel, pane.pane_id, anchor_message, remote_id=pane.remote_id)
+        await fail_prompt_session(
+            channel,
+            pane.pane_id,
+            f"❌ Remote `{pane.remote_id}` is offline — input was not sent.",
+        )
         return False
 
     trigger = getattr(channel, "trigger_typing", None)
@@ -45,8 +52,14 @@ async def forward_pane_input(
 
     try:
         await client.send_input(pane.pane_id, text, keys=["enter"])
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("failed forwarding input to %s:%s", pane.remote_id, pane.pane_id)
+        await fail_prompt_session(
+            channel,
+            pane.pane_id,
+            f"❌ 未能发送到 `{pane.remote_id}:{pane.pane_id}`：{exc}\n"
+            f"_Pane 可能已关闭；在 Remote 频道执行 `/herdr sync` 清理失效线程。_",
+        )
         return False
 
     try:
