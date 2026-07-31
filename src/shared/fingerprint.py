@@ -24,4 +24,8 @@ def cert_sha256_fingerprint(cert_pem_or_der: bytes) -> str:
 
 
 def fingerprints_match(expected: str, actual: str) -> bool:
-    return hmac.compare_digest(_normalize_fingerprint(expected), _normalize_fingerprint(actual))
+    left = _normalize_fingerprint(expected)
+    right = _normalize_fingerprint(actual)
+    if len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
