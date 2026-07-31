@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -107,6 +108,20 @@ async def test_flush_after_cooldown_applies_pending_edit():
     edited = _edited_content(msg)
     assert "second" in edited
     assert "working" in edited
+
+
+@pytest.mark.asyncio
+async def test_deferred_edit_flushes_when_no_later_push_arrives():
+    thread, msg = _make_thread()
+    cfg = _bridge(edit_cooldown=0.02)
+
+    await apply_terminal_view(thread, "pane-1", "first", "idle", cfg)
+    await apply_terminal_view(thread, "pane-1", "final", "working", cfg)
+
+    await asyncio.sleep(0.05)
+
+    msg.edit.assert_awaited_once()
+    assert "final" in _edited_content(msg)
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ssl
 
 
@@ -23,4 +24,4 @@ def cert_sha256_fingerprint(cert_pem_or_der: bytes) -> str:
 
 
 def fingerprints_match(expected: str, actual: str) -> bool:
-    return _normalize_fingerprint(expected) == _normalize_fingerprint(actual)
+    return hmac.compare_digest(_normalize_fingerprint(expected), _normalize_fingerprint(actual))

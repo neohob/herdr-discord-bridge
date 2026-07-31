@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.bot.choice_ui import BlockedChoiceView
+from src.bot.choice_ui import BlockedChoiceView, _choice_custom_id
 from src.bot.config import OperatorsConfig
 
 
@@ -45,4 +45,14 @@ async def test_choice_view_rejects_non_operator_interaction() -> None:
     interaction.response.send_message.assert_awaited_once_with(
         "Operator permission is required.",
         ephemeral=True,
+    )
+
+
+def test_choice_view_is_persistent_and_encodes_target_in_custom_ids() -> None:
+    view = BlockedChoiceView("lab", "w1:p1")
+
+    assert view.timeout is None
+    assert all(
+        child.custom_id == _choice_custom_id("lab", "w1:p1", action)
+        for child, action in zip(view.children, ("yes", "no", "custom"), strict=True)
     )

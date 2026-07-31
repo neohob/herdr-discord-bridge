@@ -38,12 +38,14 @@ class GatewayClient:
         on_control_ready: Callable[[], Awaitable[None]] | None = None,
         min_backoff: float = 0.5,
         max_backoff: float = 30.0,
+        control_heartbeat: float = 15.0,
     ) -> None:
         self._remote = remote
         self._on_event = on_event
         self._on_control_ready = on_control_ready
         self._min_backoff = min_backoff
         self._max_backoff = max_backoff
+        self._control_heartbeat = control_heartbeat
 
         self._stopped = asyncio.Event()
         self._control_ready = asyncio.Event()
@@ -159,7 +161,7 @@ class GatewayClient:
                         # logs individual observe failures and the caller may retry.
                         pass
                 backoff = self._min_backoff
-                await self._control_lost.wait()
+                await self._monitor_control_connection()
             except TlsFingerprintError as exc:
                 self._fingerprint_error = exc
                 break
@@ -175,6 +177,23 @@ class GatewayClient:
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self._max_backoff)
+
+    async def _monitor_control_connection(self) -> None:
+        """Detect an idle control disconnect with periodic Gateway pings."""
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._control_lost.wait(),
+                    timeout=self._control_heartbeat,
+                )
+                return
+            except TimeoutError:
+                pass
+
+            # A write/read round trip detects a peer that closed while the Bot
+            # had no user RPCs to send. request() marks the connection lost on
+            # every transport or protocol failure.
+            await self.request("ping")
 
     async def _push_reconnect_loop(self) -> None:
         backoff = self._min_backoff

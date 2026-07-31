@@ -15,6 +15,7 @@ async def on_guild_channel_delete(bot: Any, channel: Any) -> None:
         if remote.channel_id != channel_id:
             continue
         bot.registry.unbind_channel(remote.id)
+        bot.mapping.remove_remote(remote.id)
         runtime = getattr(bot, "runtime", None)
         client = runtime.clients.pop(remote.id, None) if runtime is not None else None
         if client is not None:

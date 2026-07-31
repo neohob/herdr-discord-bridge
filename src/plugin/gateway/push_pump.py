@@ -46,29 +46,32 @@ class PushPump:
         self._subscriptions = subscriptions or DEFAULT_SUBSCRIPTIONS
         self._observe_tasks: dict[str, asyncio.Task[None]] = {}
         self._shutdown = asyncio.Event()
+        self._subscriber_min_backoff = 0.5
+        self._subscriber_max_backoff = 30.0
 
     async def run(self) -> None:
-        """Subscribe to Herdr events and broadcast them until cancelled."""
-        subscriber = self._subscriber_factory()
-        await subscriber.start(self._herdr_socket, self._subscriptions)
-        try:
-            while not self._shutdown.is_set():
-                try:
+        """Subscribe to Herdr events and reconnect after subscriber failures."""
+        backoff = self._subscriber_min_backoff
+        while not self._shutdown.is_set():
+            subscriber = self._subscriber_factory()
+            try:
+                await subscriber.start(self._herdr_socket, self._subscriptions)
+                backoff = self._subscriber_min_backoff
+                while not self._shutdown.is_set():
                     payload = await subscriber.recv_event()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    if self._shutdown.is_set():
-                        break
-                    await asyncio.sleep(self.poll_interval)
-                    continue
-                await self._push_hub.broadcast(payload)
-        finally:
-            close = getattr(subscriber, "close", None)
-            if close is not None:
-                maybe = close()
-                if asyncio.iscoroutine(maybe):
-                    await maybe
+                    await self._push_hub.broadcast(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                if not self._shutdown.is_set():
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._subscriber_max_backoff)
+            finally:
+                close = getattr(subscriber, "close", None)
+                if close is not None:
+                    maybe = close()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
 
     async def set_observe(self, pane_id: str, enable: bool) -> None:
         """Start or stop Gateway-local terminal observe for *pane_id*."""

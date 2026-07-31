@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 
 from src.bot.chat_input import on_message as forward_chat_input
+from src.bot.choice_ui import PersistentChoiceButton
 from src.bot.commands import register_commands
 from src.bot.config import AppConfig, load_config
 from src.bot.gateway_client import GatewayClient
@@ -60,6 +61,9 @@ class BridgeBot(commands.Bot):
         await handle_raw_thread_delete(self, payload)
 
     async def setup_hook(self) -> None:
+        # Dynamic persistent components recover blocked-choice callbacks from
+        # their encoded remote/pane IDs after a process restart.
+        self.add_dynamic_items(PersistentChoiceButton)
         register_commands(self.tree, self)
         if self.config.discord.guild_id:
             guild = discord.Object(id=self.config.discord.guild_id)

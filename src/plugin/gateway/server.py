@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ssl
 from collections.abc import Callable
 from typing import Any
@@ -169,7 +170,7 @@ async def _handle_client(
         role = params.get("role")
         req_id = req.get("id")
 
-        if token != cfg.token:
+        if not isinstance(token, str) or not hmac.compare_digest(token, cfg.token):
             await _send_and_close(writer, _error_response(req_id, "auth_failed", "invalid token"))
             return
 

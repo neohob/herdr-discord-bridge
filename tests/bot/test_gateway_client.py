@@ -4,6 +4,8 @@ import asyncio
 import os
 import socket
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -236,3 +238,50 @@ async def test_gateway_client_observe_pane_and_push(tmp_path):
             except asyncio.CancelledError:
                 pass
         await pump.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_control_eof_reconnects_and_restores_observes() -> None:
+    """A control EOF is detected by heartbeat without a user RPC."""
+    remote = RemoteRecord("r1", "unused", 1, "token", "fingerprint")
+    ready_calls: list[None] = []
+
+    async def on_ready() -> None:
+        ready_calls.append(None)
+
+    def connection(lines: list[bytes]) -> tuple[SimpleNamespace, MagicMock]:
+        reader = SimpleNamespace(readline=AsyncMock(side_effect=lines))
+        writer = MagicMock()
+        writer.is_closing.return_value = False
+        writer.wait_closed = AsyncMock()
+        return reader, writer
+
+    pong = encode_line({"id": "heartbeat", "result": {"type": "pong"}})
+    first = connection([pong, b""])
+    second = connection([pong] * 20)
+
+    async def fake_connect(role: str):
+        if role == "control":
+            return next(control_connections)
+        await asyncio.Event().wait()
+
+    control_connections = iter([first, second])
+    client = GatewayClient(
+        remote,
+        lambda _event: asyncio.sleep(0),
+        on_control_ready=on_ready,
+        min_backoff=0.01,
+        max_backoff=0.02,
+        control_heartbeat=0.01,
+    )
+    client._connect = fake_connect  # type: ignore[method-assign]  # noqa: SLF001
+    await client.start()
+    try:
+        async def restored() -> bool:
+            while len(ready_calls) < 2:
+                await asyncio.sleep(0.005)
+            return True
+
+        await asyncio.wait_for(restored(), timeout=0.5)
+    finally:
+        await client.stop()

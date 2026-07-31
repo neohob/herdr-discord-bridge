@@ -141,6 +141,39 @@ async def test_run_broadcasts_herdr_events(
 
 
 @pytest.mark.asyncio
+async def test_run_recreates_subscriber_after_start_failure(
+    push_hub: EventCollectingHub,
+    fake_herdr: FakeHerdrClient,
+):
+    class FailingSubscriber(FakeHerdrSubscriber):
+        async def start(self, path: str, subscriptions: list[dict]) -> None:
+            raise ConnectionError("socket unavailable")
+
+    recovered = FakeHerdrSubscriber([{"event": "pane.created", "data": {"pane_id": "w2:p2"}}])
+    attempts = iter([FailingSubscriber([]), recovered])
+    pump = PushPump(
+        push_hub,
+        herdr_socket="/tmp/fake.sock",
+        herdr_factory=lambda: fake_herdr,
+        subscriber_factory=lambda: next(attempts),
+    )
+    pump._subscriber_min_backoff = 0.01  # noqa: SLF001
+    pump._subscriber_max_backoff = 0.02  # noqa: SLF001
+    run_task = asyncio.create_task(pump.run())
+    try:
+        event = await push_hub.wait_event("pane.created", timeout=1)
+        assert event["data"]["pane_id"] == "w2:p2"
+        assert recovered.started
+    finally:
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+        await pump.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_observe_emits_terminal_output(
     push_hub: EventCollectingHub,
     fake_herdr: FakeHerdrClient,

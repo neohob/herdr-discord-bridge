@@ -14,12 +14,18 @@ async def test_channel_delete_unbinds_remote_and_stops_client() -> None:
         list=lambda: [SimpleNamespace(id="lab", channel_id=10)],
         unbind_channel=Mock(),
     )
+    mapping = SimpleNamespace(remove_remote=Mock())
     client = SimpleNamespace(stop=AsyncMock())
-    bot = SimpleNamespace(registry=registry, runtime=SimpleNamespace(clients={"lab": client}))
+    bot = SimpleNamespace(
+        registry=registry,
+        mapping=mapping,
+        runtime=SimpleNamespace(clients={"lab": client}),
+    )
 
     await on_guild_channel_delete(bot, SimpleNamespace(id=10))
 
     registry.unbind_channel.assert_called_once_with("lab")
+    mapping.remove_remote.assert_called_once_with("lab")
     client.stop.assert_awaited_once()
     assert bot.runtime.clients == {}
 

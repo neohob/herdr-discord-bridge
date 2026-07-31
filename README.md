@@ -13,8 +13,8 @@ Discord Bot + Herdr Gateway 插件，通过 **TLS NDJSON** 把远程 Herdr 主�
 
 ```bash
 herdr plugin link /path/to/herdr-discord-bridge/src/plugin
-herdr plugin action invoke setup --plugin herdr.discord-bridge
-herdr plugin action invoke start --plugin herdr.discord-bridge
+herdr plugin action invoke setup --plugin herdr-discord-bridge
+herdr plugin action invoke start --plugin herdr-discord-bridge
 ```
 
 记下 setup 输出的 host、port、token、TLS 指纹，供 Discord 内 `/herdr register` 使用。

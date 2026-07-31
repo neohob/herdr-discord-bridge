@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -26,6 +27,7 @@ class _TerminalState:
     text: str = ""
     status: str = "unknown"
     remote_id: str = ""
+    flush_task: asyncio.Task[None] | None = None
 
 
 _states: dict[tuple[int, str], _TerminalState] = {}
@@ -47,6 +49,9 @@ def _get_state(thread: discord.Thread | Any, pane_id: str) -> _TerminalState:
 def clear_terminal_state(thread_id: int | None = None, pane_id: str | None = None) -> None:
     """Drop in-memory coalesce state (primarily for tests)."""
     if thread_id is None and pane_id is None:
+        for state in _states.values():
+            if state.flush_task is not None:
+                state.flush_task.cancel()
         _states.clear()
         return
     drop = [
@@ -56,7 +61,9 @@ def clear_terminal_state(thread_id: int | None = None, pane_id: str | None = Non
         and (pane_id is None or key[1] == pane_id)
     ]
     for key in drop:
-        _states.pop(key, None)
+        state = _states.pop(key, None)
+        if state is not None and state.flush_task is not None:
+            state.flush_task.cancel()
 
 
 def render_terminal_content(
@@ -123,9 +130,34 @@ async def apply_terminal_view(
     cooldown = bridge_cfg.terminal.edit_cooldown
     if not force and state.message_id is not None and (now - state.last_edit) < cooldown:
         state.pending = True
+        if state.flush_task is None or state.flush_task.done():
+            delay = cooldown - (now - state.last_edit)
+            state.flush_task = asyncio.create_task(
+                _flush_after_cooldown(thread, pane_id, bridge_cfg, state, delay, clock),
+                name=f"terminal-view-flush-{thread.id}-{pane_id}",
+            )
         return state.message_id
 
     return await _flush_state(thread, pane_id, bridge_cfg, state, clock=clock)
+
+
+async def _flush_after_cooldown(
+    thread: discord.Thread | Any,
+    pane_id: str,
+    bridge_cfg: BridgeConfig,
+    state: _TerminalState,
+    delay: float,
+    clock: Callable[[], float],
+) -> None:
+    try:
+        await asyncio.sleep(max(0.0, delay))
+        if state.pending:
+            await flush_terminal_view(thread, pane_id, bridge_cfg, clock=clock)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if state.flush_task is asyncio.current_task():
+            state.flush_task = None
 
 
 async def flush_terminal_view(
