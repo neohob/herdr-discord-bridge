@@ -1,11 +1,12 @@
-"""Terminal View: plain-text continuation from the last message's end.
+"""Chat-style Pane replies: one user message → one Bot reply (streamed via edits).
 
-Rules:
-- No Embeds, no code fences — plain Discord text (readable).
-- Previously posted messages are never edited again.
-- Only **new** lines (after the last posted line) go into the current live
-  message; when it fills, we leave it alone and start a new message for the
-  remainder.
+Discord has no native token stream. The standard pattern is:
+  1. Reply immediately with a placeholder
+  2. Throttle-edit that same message as new Pane output arrives
+  3. If the reply hits the 2000-char cap, freeze it and continue on a new
+     message with only the remainder (previous text is never rewritten)
+
+Approve / Yes-No buttons remain separate (choice_ui) when a real prompt appears.
 """
 
 from __future__ import annotations
@@ -24,13 +25,18 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Discord content limit 2000; keep headroom for the header line.
-MSG_BODY_LIMIT = 1700
-SEGMENT_MAX_LINES = 35
+MSG_LIMIT = 2000
+# Leave room so mid-stream edits don't constantly hit the ceiling.
+SOFT_LIMIT = 1800
+# Default stream cadence if config cooldown is very low.
+MIN_EDIT_INTERVAL = 1.0
+# Discord typing indicator expires ~10s; refresh while waiting/streaming.
+TYPING_REFRESH = 8.0
+PLACEHOLDER = "思考中…"
 
 
 @dataclass
-class _TerminalState:
+class _TurnState:
     message_id: int | None = None
     last_edit: float = 0.0
     pending: bool = False
@@ -38,62 +44,66 @@ class _TerminalState:
     status: str = "unknown"
     remote_id: str = ""
     flush_task: asyncio.Task[None] | None = None
+    typing_task: asyncio.Task[None] | None = None
     needs_new_message: bool = False
     anchor_message: Any | None = None
     anchor_message_id: int | None = None
     baseline_text: str | None = None
+    # Deduped lines for this user turn only
     session_lines: list[str] = field(default_factory=list)
-    # Lines already committed into Discord (sealed + current live buffer posted).
-    posted_line_count: int = 0
-    # Start offset of the current live message within session_lines.
     live_start: int = 0
     segment_index: int = 0
     last_window: list[str] = field(default_factory=list)
+    active: bool = False  # True after begin_prompt_session until next prompt
     choice_message_id: int | None = None
     choice_fingerprint: str | None = None
 
 
-_states: dict[tuple[int, str], _TerminalState] = {}
+_states: dict[tuple[int, str], _TurnState] = {}
 
 
-def _state_key(thread: discord.Thread | Any, pane_id: str) -> tuple[int, str]:
+def _key(thread: Any, pane_id: str) -> tuple[int, str]:
     return (int(thread.id), pane_id)
 
 
-def _get_state(thread: discord.Thread | Any, pane_id: str) -> _TerminalState:
-    key = _state_key(thread, pane_id)
-    state = _states.get(key)
+def _get(thread: Any, pane_id: str) -> _TurnState:
+    k = _key(thread, pane_id)
+    state = _states.get(k)
     if state is None:
-        state = _TerminalState()
-        _states[key] = state
+        state = _TurnState()
+        _states[k] = state
     return state
 
 
-def get_terminal_state(thread: discord.Thread | Any, pane_id: str) -> _TerminalState:
-    return _get_state(thread, pane_id)
+def get_terminal_state(thread: Any, pane_id: str) -> _TurnState:
+    return _get(thread, pane_id)
+
+
+def _cancel_task(task: asyncio.Task[None] | None) -> None:
+    if task is not None and not task.done():
+        task.cancel()
 
 
 def clear_terminal_state(thread_id: int | None = None, pane_id: str | None = None) -> None:
     if thread_id is None and pane_id is None:
         for state in _states.values():
-            if state.flush_task is not None:
-                state.flush_task.cancel()
+            _cancel_task(state.flush_task)
+            _cancel_task(state.typing_task)
         _states.clear()
         return
     drop = [
-        key
-        for key in _states
-        if (thread_id is None or key[0] == thread_id)
-        and (pane_id is None or key[1] == pane_id)
+        k
+        for k in _states
+        if (thread_id is None or k[0] == thread_id) and (pane_id is None or k[1] == pane_id)
     ]
-    for key in drop:
-        state = _states.pop(key, None)
-        if state is not None and state.flush_task is not None:
-            state.flush_task.cancel()
+    for k in drop:
+        state = _states.pop(k, None)
+        if state is not None:
+            _cancel_task(state.flush_task)
+            _cancel_task(state.typing_task)
 
 
 def new_lines_from_window(session: list[str], window: list[str]) -> list[str]:
-    """Only lines in *window* not already covered by *session*."""
     if not window:
         return []
     if not session:
@@ -116,7 +126,7 @@ def new_lines_from_window(session: list[str], window: list[str]) -> list[str]:
     return list(window[idx + 1 :])
 
 
-def absorb_gateway_window(state: _TerminalState, snapshot: str) -> int:
+def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
     window = str(snapshot or "").splitlines()
     if window == state.last_window:
         return 0
@@ -154,89 +164,134 @@ def session_body(baseline: str | None, current: str, max_lines: int) -> str:
     return "\n".join(current_lines[-max_lines:])
 
 
-def render_plain(
-    *,
-    remote_id: str,
-    pane_id: str,
-    status: str,
-    bridge_cfg: BridgeConfig,
+def render_chat_reply(
     lines: list[str],
-    segment_index: int,
+    *,
+    status: str,
+    continued: bool,
     live: bool,
 ) -> str:
-    emoji = bridge_cfg.status_emoji.get(status, bridge_cfg.status_emoji.get("unknown", "❓"))
-    if live:
-        head = f"{emoji} 【终端】{remote_id}:{pane_id} · {status}"
-        if segment_index > 1:
-            head += f" · 续{segment_index}"
-    else:
-        head = f"{emoji} 【终端·已固定】续{segment_index} · {remote_id}:{pane_id}"
-    body = "\n".join(lines)
-    content = f"{head}\n{body}" if body else head
-    # Hard trim if somehow over limit (should be prevented by fit).
-    if len(content) > 2000:
-        overflow = len(content) - 1990
-        content = content[: 1990 - overflow] + "\n…"
-    return content
+    """Plain chatbot-style body — no code fences, no heavy chrome."""
+    body = "\n".join(lines).rstrip()
+    if continued and body:
+        body = f"（续）\n{body}"
+    if not body:
+        body = "…"
+    elif live and str(status).lower() in {"working", "unknown", ""}:
+        if not body.endswith("…"):
+            body = f"{body}\n…"
+    if len(body) > MSG_LIMIT:
+        body = "…" + body[-(MSG_LIMIT - 1) :]
+    return body
 
 
-def _fit_count(header: str, lines: list[str]) -> int:
+def _fit_prefix(lines: list[str], *, continued: bool) -> int:
     if not lines:
         return 0
-    limit = min(len(lines), SEGMENT_MAX_LINES)
-    for count in range(limit, 0, -1):
-        body = "\n".join(lines[:count])
-        if len(header) + 1 + len(body) <= MSG_BODY_LIMIT:
+    for count in range(len(lines), 0, -1):
+        text = render_chat_reply(lines[:count], status="idle", continued=continued, live=False)
+        if len(text) <= SOFT_LIMIT:
             return count
     return 1
 
 
-def _overflows(header: str, lines: list[str]) -> bool:
-    if len(lines) > SEGMENT_MAX_LINES:
-        return True
-    return len(header) + 1 + len("\n".join(lines)) > MSG_BODY_LIMIT
+async def _trigger_typing(thread: Any) -> None:
+    """Show Discord's native 「正在输入…」 indicator (the channel typing dots)."""
+    trigger = getattr(thread, "trigger_typing", None)
+    if not callable(trigger):
+        return
+    try:
+        await trigger()
+    except Exception:  # noqa: BLE001
+        log.debug("trigger_typing failed", exc_info=True)
+
+
+async def _typing_keepalive(thread: Any, state: _TurnState) -> None:
+    """Refresh typing while the turn is active and still working."""
+    try:
+        while state.active:
+            status = str(state.status).lower()
+            if status not in {"working", "unknown", ""}:
+                break
+            await _trigger_typing(thread)
+            await asyncio.sleep(TYPING_REFRESH)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if state.typing_task is asyncio.current_task():
+            state.typing_task = None
+
+
+def _start_typing(thread: Any, state: _TurnState) -> None:
+    _cancel_task(state.typing_task)
+    state.typing_task = None
+    try:
+        state.typing_task = asyncio.create_task(
+            _typing_keepalive(thread, state),
+            name=f"chat-typing-{getattr(thread, 'id', '?')}",
+        )
+    except RuntimeError:
+        # No running loop in some unit tests — typing is best-effort.
+        pass
+
+
+def _stop_typing(state: _TurnState) -> None:
+    _cancel_task(state.typing_task)
+    state.typing_task = None
 
 
 async def begin_prompt_session(
-    thread: discord.Thread | Any,
+    thread: Any,
     pane_id: str,
     prompt_message: Any,
     *,
     remote_id: str = "",
 ) -> None:
-    state = _get_state(thread, pane_id)
-    if state.flush_task is not None and not state.flush_task.done():
-        state.flush_task.cancel()
-        state.flush_task = None
+    """Start a chat turn: reply under the user message with a streaming placeholder."""
+    state = _get(thread, pane_id)
+    _cancel_task(state.flush_task)
+    state.flush_task = None
+    _stop_typing(state)
     state.pending = False
-    # Leave any previous live message untouched; open a new chain under this prompt.
-    state.needs_new_message = True
-    state.message_id = None
     state.anchor_message = prompt_message
     state.anchor_message_id = int(getattr(prompt_message, "id", 0) or 0) or None
     state.baseline_text = state.text
     state.session_lines = []
-    state.posted_line_count = 0
     state.live_start = 0
     state.segment_index = 0
     state.last_window = []
+    state.active = True
+    state.status = "working"
+    state.choice_fingerprint = None
     if remote_id:
         state.remote_id = remote_id
-    state.choice_fingerprint = None
+
+    # Instant feedback: typing dots + placeholder bubble under the user message.
+    await _trigger_typing(thread)
+    _start_typing(thread, state)
+    try:
+        if hasattr(prompt_message, "reply"):
+            msg = await prompt_message.reply(PLACEHOLDER)
+        else:
+            msg = await thread.send(PLACEHOLDER)
+    except Exception:  # noqa: BLE001
+        log.exception("failed posting chat placeholder")
+        state.message_id = None
+        state.needs_new_message = True
+        return
+    state.message_id = int(msg.id)
+    state.needs_new_message = False
+    # Allow the first content edit immediately after the placeholder.
+    state.last_edit = 0.0
 
 
-async def _send_new(
-    thread: discord.Thread | Any,
-    state: _TerminalState,
-    content: str,
-) -> Any:
+async def _send_new(thread: Any, state: _TurnState, content: str) -> Any:
     msg: Any = None
     anchor = state.anchor_message
     if anchor is not None and hasattr(anchor, "reply"):
         try:
             msg = await anchor.reply(content)
         except Exception:  # noqa: BLE001
-            log.debug("prompt reply failed; falling back to thread.send", exc_info=True)
             msg = None
     if msg is None:
         msg = await thread.send(content)
@@ -245,11 +300,7 @@ async def _send_new(
     return msg
 
 
-async def _edit_live(
-    thread: discord.Thread | Any,
-    state: _TerminalState,
-    content: str,
-) -> Any:
+async def _edit_live(thread: Any, state: _TurnState, content: str) -> Any:
     if state.message_id is None or state.needs_new_message:
         return await _send_new(thread, state, content)
     try:
@@ -263,7 +314,7 @@ async def _edit_live(
 
 
 async def apply_terminal_view(
-    thread: discord.Thread | Any,
+    thread: Any,
     pane_id: str,
     text: str,
     status: str,
@@ -274,26 +325,35 @@ async def apply_terminal_view(
     message_id: int | None = None,
     clock: Callable[[], float] = time.time,
 ) -> int | None:
-    state = _get_state(thread, pane_id)
-    if message_id is not None and not state.needs_new_message and state.message_id is None:
-        state.message_id = message_id
+    """Stream Pane output into the active chat reply (no-op without an active turn)."""
+    state = _get(thread, pane_id)
     if remote_id:
         state.remote_id = remote_id
     state.text = text
     state.status = status or "unknown"
-    added = absorb_gateway_window(state, text)
-
-    if (
-        added == 0
-        and not force
-        and state.message_id is not None
-        and not state.needs_new_message
-        and state.session_lines
+    status_l = str(state.status).lower()
+    if state.active and status_l not in {"working", "unknown", ""}:
+        _stop_typing(state)
+    elif state.active and status_l in {"working", "unknown", ""} and (
+        state.typing_task is None or state.typing_task.done()
     ):
+        _start_typing(thread, state)
+
+    # Chatbot mode: ignore background Pane noise until the user sends a message.
+    if not state.active and not force:
+        absorb_gateway_window(state, text)  # keep baseline fresh
+        state.session_lines = []
+        return state.message_id
+
+    if message_id is not None and not state.needs_new_message and state.message_id is None:
+        state.message_id = message_id
+
+    added = absorb_gateway_window(state, text)
+    if added == 0 and not force and state.message_id is not None and state.session_lines:
         return state.message_id
 
     now = clock()
-    cooldown = bridge_cfg.terminal.edit_cooldown
+    cooldown = max(float(bridge_cfg.terminal.edit_cooldown), MIN_EDIT_INTERVAL)
     if (
         not force
         and state.message_id is not None
@@ -304,19 +364,19 @@ async def apply_terminal_view(
         if state.flush_task is None or state.flush_task.done():
             delay = cooldown - (now - state.last_edit)
             state.flush_task = asyncio.create_task(
-                _flush_after_cooldown(thread, pane_id, bridge_cfg, state, delay, clock),
-                name=f"terminal-view-flush-{thread.id}-{pane_id}",
+                _flush_after(thread, pane_id, bridge_cfg, state, delay, clock),
+                name=f"chat-stream-{thread.id}-{pane_id}",
             )
         return state.message_id
 
-    return await _flush_state(thread, pane_id, bridge_cfg, state, clock=clock)
+    return await _flush(thread, pane_id, bridge_cfg, state, clock=clock)
 
 
-async def _flush_after_cooldown(
-    thread: discord.Thread | Any,
+async def _flush_after(
+    thread: Any,
     pane_id: str,
     bridge_cfg: BridgeConfig,
-    state: _TerminalState,
+    state: _TurnState,
     delay: float,
     clock: Callable[[], float],
 ) -> None:
@@ -332,97 +392,64 @@ async def _flush_after_cooldown(
 
 
 async def flush_terminal_view(
-    thread: discord.Thread | Any,
+    thread: Any,
     pane_id: str,
     bridge_cfg: BridgeConfig,
     *,
     clock: Callable[[], float] = time.time,
 ) -> int | None:
-    state = _get_state(thread, pane_id)
+    state = _get(thread, pane_id)
     if not state.pending:
         return state.message_id
-    return await _flush_state(thread, pane_id, bridge_cfg, state, clock=clock)
+    return await _flush(thread, pane_id, bridge_cfg, state, clock=clock)
 
 
-async def _flush_state(
-    thread: discord.Thread | Any,
+async def _flush(
+    thread: Any,
     pane_id: str,
     bridge_cfg: BridgeConfig,
-    state: _TerminalState,
+    state: _TurnState,
     *,
     clock: Callable[[], float],
 ) -> int | None:
-    """Publish only new lines after what was already posted; never rewrite sealed msgs."""
     state.pending = False
-    remote_id = state.remote_id or "remote"
+    if not state.active:
+        return state.message_id
 
     if not state.session_lines and state.text:
         absorb_gateway_window(state, state.text)
 
-    # Lines not yet reflected in any Discord message content for the live card.
-    # live card covers session_lines[live_start : ...]
-    # We grow the live card until full, then freeze it (never edit again) and continue.
-
     try:
         while True:
             live_lines = state.session_lines[state.live_start :]
-            if not live_lines:
-                return state.message_id
-
-            seg = state.segment_index + 1
-            header = render_plain(
-                remote_id=remote_id,
-                pane_id=pane_id,
+            continued = state.segment_index > 0
+            content = render_chat_reply(
+                live_lines,
                 status=state.status,
-                bridge_cfg=bridge_cfg,
-                lines=[],
-                segment_index=seg,
+                continued=continued,
                 live=True,
-            ).split("\n", 1)[0]
-
-            if not _overflows(header, live_lines):
-                content = render_plain(
-                    remote_id=remote_id,
-                    pane_id=pane_id,
-                    status=state.status,
-                    bridge_cfg=bridge_cfg,
-                    lines=live_lines,
-                    segment_index=seg,
-                    live=True,
-                )
+            )
+            if len(content) <= SOFT_LIMIT or len(live_lines) <= 1:
                 await _edit_live(thread, state, content)
-                state.posted_line_count = len(state.session_lines)
                 state.last_edit = clock()
                 return state.message_id
 
-            # Live card would overflow: finalize a fitted prefix as a frozen message,
-            # then open a new live message for the rest (previous content stays).
-            fit = _fit_count(header, live_lines)
-            if fit <= 0:
-                fit = 1
+            # Freeze a fitted prefix; continue streaming on a new reply.
+            fit = _fit_prefix(live_lines, continued=continued)
             if fit >= len(live_lines):
-                # Can't split usefully; trim oldest within this live card only.
-                fit = max(1, len(live_lines) - 5)
-
-            sealed_lines = live_lines[:fit]
-            state.segment_index += 1
-            sealed_content = render_plain(
-                remote_id=remote_id,
-                pane_id=pane_id,
+                fit = max(1, len(live_lines) - 1)
+            sealed = render_chat_reply(
+                live_lines[:fit],
                 status=state.status,
-                bridge_cfg=bridge_cfg,
-                lines=sealed_lines,
-                segment_index=state.segment_index,
+                continued=continued,
                 live=False,
             )
-            # Write final content onto current live message, then detach so we never edit it again.
-            await _edit_live(thread, state, sealed_content)
+            await _edit_live(thread, state, sealed)
             state.live_start += fit
-            state.posted_line_count = state.live_start
+            state.segment_index += 1
             state.message_id = None
             state.needs_new_message = True
             state.last_edit = clock()
-            # Loop to publish remainder as a new live message.
     except discord.HTTPException as exc:
-        log.warning("terminal view update failed %s/%s: %s", remote_id, pane_id, exc)
+        log.warning("chat stream update failed %s/%s: %s", state.remote_id, pane_id, exc)
         return state.message_id

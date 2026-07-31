@@ -32,16 +32,31 @@ async def on_message(bot: Any, message: Any) -> None:
         log.warning("ignoring input for offline remote %s", pane.remote_id)
         return
 
-    # Open a new live terminal reply under this prompt; dismiss stale choices.
-    await clear_choice_message(channel, pane.pane_id, note="_(superseded by new prompt)_")
+    # Instant Discord feedback (typing dots) before any slower work.
+    trigger = getattr(channel, "trigger_typing", None)
+    if callable(trigger):
+        try:
+            await trigger()
+        except Exception:  # noqa: BLE001
+            log.debug("trigger_typing failed", exc_info=True)
+
+    # Reply bubble + typing keepalive; then forward input.
     await begin_prompt_session(channel, pane.pane_id, message, remote_id=pane.remote_id)
-    # Force the next terminal push to create a new message (not edit the old live).
-    bot.mapping.set_terminal_message(pane.remote_id, pane.pane_id, None)
+    clear_map = getattr(bot.mapping, "set_terminal_message", None)
+    if callable(clear_map):
+        clear_map(pane.remote_id, pane.pane_id, None)
 
     try:
         await client.send_input(pane.pane_id, text, keys=["enter"])
     except Exception:  # noqa: BLE001
         log.exception("failed forwarding input to %s:%s", pane.remote_id, pane.pane_id)
+        return
+
+    # Dismiss stale Yes/No after the turn has already started (non-blocking feel).
+    try:
+        await clear_choice_message(channel, pane.pane_id, note="_(superseded by new prompt)_")
+    except Exception:  # noqa: BLE001
+        log.debug("clear_choice_message failed", exc_info=True)
 
 
 def _is_command(bot: Any, text: str) -> bool:

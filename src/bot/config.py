@@ -44,7 +44,7 @@ class DiscordConfig:
 @dataclass(slots=True)
 class TerminalConfig:
     max_lines: int = 50
-    edit_cooldown: float = 2.0
+    edit_cooldown: float = 1.2
     poll_interval: float = 2.0
 
 

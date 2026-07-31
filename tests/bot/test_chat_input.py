@@ -20,14 +20,20 @@ async def test_chat_input_forwards_mapped_human_message() -> None:
         runtime=SimpleNamespace(clients={"lab": client}),
         command_prefix="!",
     )
+    reply = SimpleNamespace(id=99)
+    channel = SimpleNamespace(id=20, send=AsyncMock(), trigger_typing=AsyncMock())
     message = SimpleNamespace(
-        channel=SimpleNamespace(id=20),
+        channel=channel,
         author=SimpleNamespace(bot=False),
         content="continue",
+        id=42,
+        reply=AsyncMock(return_value=reply),
     )
 
     await on_message(bot, message)
 
+    channel.trigger_typing.assert_awaited()
+    message.reply.assert_awaited_once()
     client.send_input.assert_awaited_once_with("w1:p1", "continue", keys=["enter"])
 
 
