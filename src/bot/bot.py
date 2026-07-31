@@ -10,7 +10,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from src.bot.bridge.commands import register_commands
+from src.bot.commands import register_commands
 from src.bot.config import AppConfig, load_config
 from src.bot.gateway_client import GatewayClient
 from src.bot.mapping import MappingStore
