@@ -41,6 +41,16 @@ def test_find_by_thread(tmp_path):
     assert found.pane_id == "w1:p1"
 
 
+def test_remove_remote_clears_channel_and_panes(tmp_path):
+    store = MappingStore(tmp_path / "mapping.json")
+    store.set_remote_channel("host-a", 100)
+    store.upsert_pane(PaneMapping("host-a", "w1:p1", thread_id=200))
+
+    store.remove_remote("host-a")
+
+    assert "host-a" not in store.remotes
+
+
 def test_load_legacy_category_and_channel_ids(tmp_path):
     path = tmp_path / "mapping.json"
     path.write_text(

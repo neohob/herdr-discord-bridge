@@ -108,6 +108,16 @@ async def _stop_remote(runtime: Runtime, remote_id: str) -> None:
         await client.stop()
 
 
+async def _ensure_client(bot: BridgeBot, remote_id: str) -> Any:
+    """Return a live Gateway client, starting its bound Remote when needed."""
+    remote = bot.registry.get(remote_id)
+    if remote is None:
+        raise RuntimeError(f"remote `{remote_id}` is not registered")
+    runtime = _runtime(bot)
+    client = runtime.clients.get(remote_id)
+    return client if client is not None else await runtime.start_remote(remote)
+
+
 async def _map_panes(
     *,
     interaction: discord.Interaction[Any],
@@ -116,9 +126,8 @@ async def _map_panes(
     panes: list[dict[str, Any]],
 ) -> int:
     channel = await _remote_channel(interaction, remote, bot.mapping)
-    client = _runtime(bot).clients.get(remote.id)
-    if client is None:
-        client = await _runtime(bot).start_remote(remote)
+    client = await _ensure_client(bot, remote.id)
+    mapped = 0
     for pane_data in panes:
         pane = PaneInfo.from_dict(pane_data)
         if not pane.pane_id:
@@ -131,7 +140,8 @@ async def _map_panes(
             bridge_cfg=bot.config.bridge,
         )
         await client.observe_pane(pane.pane_id, True)
-    return len(panes)
+        mapped += 1
+    return mapped
 
 
 class _RebindSelect(discord.ui.Select):
@@ -268,6 +278,7 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             if bot.runtime is not None:
                 await _stop_remote(bot.runtime, target)
             bot.registry.remove(target)
+            bot.mapping.remove_remote(target)
             await _respond(interaction, f"Removed Remote `{target}`.", ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Could not remove Remote: {exc}", ephemeral=True)
@@ -296,10 +307,7 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run Sync in a Remote Channel.", ephemeral=True)
             return
         try:
-            runtime = _runtime(bot)
-            client = runtime.clients.get(remote.id)
-            if client is None:
-                client = await runtime.start_remote(remote)
+            client = await _ensure_client(bot, remote.id)
             result = await client.request("pane.list")
             panes = extract_list(result, "panes", "items")
             count = await _map_panes(interaction=interaction, bot=bot, remote=remote, panes=panes)
@@ -314,7 +322,7 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run this in a Remote Channel or Pane Thread.", ephemeral=True)
             return
         try:
-            result = await _runtime(bot).clients[remote_id].request("pane.list")
+            result = await (await _ensure_client(bot, remote_id)).request("pane.list")
             await _respond(interaction, _result_text(result), ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Pane list failed: {exc}", ephemeral=True)
@@ -328,7 +336,7 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run pane split inside a Pane Thread.", ephemeral=True)
             return
         try:
-            result = await _runtime(bot).clients[remote_id].request(
+            result = await (await _ensure_client(bot, remote_id)).request(
                 "pane.split", {"pane_id": pane_id, "direction": direction}
             )
             pane_data = result if isinstance(result, dict) else {}
@@ -351,7 +359,7 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run pane close in a Pane Thread or supply a Pane id.", ephemeral=True)
             return
         try:
-            client = _runtime(bot).clients[remote_id]
+            client = await _ensure_client(bot, remote_id)
             await client.request("pane.close", {"pane_id": target})
             await client.observe_pane(target, False)
             pane = bot.mapping.get_pane(remote_id, target)
@@ -360,7 +368,10 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
                 if thread is None:
                     thread = await interaction.guild.fetch_channel(pane.thread_id)
                 if isinstance(thread, discord.Thread):
-                    await thread.delete(reason=f"Herdr pane {target} closed")
+                    try:
+                        await thread.delete(reason=f"Herdr pane {target} closed")
+                    except discord.HTTPException:
+                        await thread.edit(archived=True, reason=f"Herdr pane {target} closed")
             bot.mapping.remove_pane(remote_id, target)
             await _respond(interaction, f"Closed Pane `{target}`.", ephemeral=True)
         except Exception as exc:
@@ -374,7 +385,9 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run pane read in a Pane Thread or supply a Pane id.", ephemeral=True)
             return
         try:
-            result = await _runtime(bot).clients[remote_id].request("pane.read", {"pane_id": target})
+            result = await (await _ensure_client(bot, remote_id)).request(
+                "pane.read", {"pane_id": target}
+            )
             await _respond(interaction, _result_text(result), ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Pane read failed: {exc}", ephemeral=True)
@@ -386,7 +399,7 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run this in a Remote Channel or Pane Thread.", ephemeral=True)
             return
         try:
-            result = await _runtime(bot).clients[remote_id].request("workspace.list")
+            result = await (await _ensure_client(bot, remote_id)).request("workspace.list")
             await _respond(interaction, _result_text(result), ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Workspace list failed: {exc}", ephemeral=True)
@@ -400,7 +413,9 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await _respond(interaction, "Run this in a Remote Channel or Pane Thread.", ephemeral=True)
             return
         try:
-            result = await _runtime(bot).clients[remote_id].request("workspace.create", {"label": label})
+            result = await (await _ensure_client(bot, remote_id)).request(
+                "workspace.create", {"label": label}
+            )
             await _respond(interaction, _result_text(result), ephemeral=True)
         except Exception as exc:
             await _respond(interaction, f"Workspace create failed: {exc}", ephemeral=True)

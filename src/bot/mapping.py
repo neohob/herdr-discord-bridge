@@ -117,6 +117,14 @@ class MappingStore:
             rm.panes.pop(pane_id, None)
             self.save()
 
+    def remove_remote(self, remote_id: str) -> None:
+        """Remove a Remote Channel and all of its Pane Thread mappings."""
+        with self._lock:
+            if remote_id not in self.remotes:
+                return
+            del self.remotes[remote_id]
+            self.save()
+
     def get_pane(self, remote_id: str, pane_id: str) -> PaneMapping | None:
         rm = self.remotes.get(remote_id)
         if not rm:
