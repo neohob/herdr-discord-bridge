@@ -17,6 +17,7 @@ from src.bot.terminal_view import (
     merge_added_lines,
     new_lines_from_window,
     render_chat_reply,
+    status_template_key,
     window_diff_lines,
 )
 from src.bot.terminal_view import _TurnState
@@ -123,6 +124,62 @@ def test_absorb_coalesces_typing_echo_across_snapshots():
     absorb_gateway_window(state, "base\n  → 有个问")
     absorb_gateway_window(state, "base\n  → 有个问题，怎么调用skills呢？")
     assert state.session_lines == ["  → 有个问题，怎么调用skills呢？"]
+
+
+def test_status_template_key_groups_waiting_shell_countdown():
+    a = status_template_key("    Waiting 9m 16s for shell")
+    b = status_template_key("    Waiting 9m 15s for shell")
+    c = status_template_key(" ⠰⠳ Waiting  52.04k tokens")
+    d = status_template_key(" ⠰⠰ Waiting  52.04k tokens")
+    assert a is not None and a == b
+    assert c is not None and c == d
+    assert a != c
+
+
+def test_merge_coalesces_multiline_waiting_status_block():
+    session: list[str] = []
+    merge_added_lines(
+        session,
+        [
+            " ⠰⠳ Waiting  52.04k tokens",
+            "    Waiting 9m 16s for shell",
+        ],
+    )
+    merge_added_lines(
+        session,
+        [
+            " ⠰⠰ Waiting  52.04k tokens",
+            "    Waiting 9m 15s for shell",
+        ],
+    )
+    merge_added_lines(
+        session,
+        [
+            " ⠠⠛ Waiting  52.04k tokens",
+            "    Waiting 9m 14s for shell",
+        ],
+    )
+    assert len(session) == 2
+    assert "52.04k" in session[0]
+    assert "9m 14s" in session[1]
+
+
+def test_absorb_coalesces_waiting_shell_across_snapshots():
+    state = _TurnState(baseline_text="base", last_window=["base"], last_snapshot="base")
+    absorb_gateway_window(
+        state,
+        "base\n ⠰⠳ Waiting  52.04k tokens\n    Waiting 9m 16s for shell",
+    )
+    absorb_gateway_window(
+        state,
+        "base\n ⠰⠰ Waiting  52.04k tokens\n    Waiting 9m 15s for shell",
+    )
+    absorb_gateway_window(
+        state,
+        "base\n ⠠⠛ Waiting  52.04k tokens\n    Waiting 9m 14s for shell",
+    )
+    assert len(state.session_lines) == 2
+    assert "9m 14s" in state.session_lines[1]
 
 
 def test_render_chat_plain():

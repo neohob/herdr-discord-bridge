@@ -41,10 +41,22 @@ FLUSH_RETRY_DELAY = 1.5
 # TUI spinners (braille + common unicode spinners) rewritten in-place each frame.
 _BRAILLE_RE = re.compile(r"[\u2800-\u28FF]+")
 _SPINNER_GLYPH_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]+")
-_STATUS_LINE_RE = re.compile(
-    r"^(?:Running|Working|Thinking|Waiting)\s+[\d.,]+\s*k?\s*tokens\s*$",
+# Live status verbs — not exhaustive; template also keys off timers/counters.
+_PHASE_RE = re.compile(
+    r"\b(?:Running|Working|Thinking|Waiting|Downloading|Uploading|Building|"
+    r"Compiling|Installing|Syncing|Loading|Processing|Searching|Indexing|"
+    r"Connecting|Retrying|Pending)\b",
     re.IGNORECASE,
 )
+_TOKEN_COUNT_RE = re.compile(r"\b[\d.,]+\s*[kKmM]?\s*tokens?\b", re.IGNORECASE)
+_DURATION_RE = re.compile(
+    r"\b\d+\s*[hH]\s*\d+\s*[mM](?:\s*\d+\s*[sS])?\b|"
+    r"\b\d+\s*[mM]\s*\d+\s*[sS]\b|"
+    r"\b\d+(?:\.\d+)?\s*[hmsHMS]\b"
+)
+_PERCENT_RE = re.compile(r"\b\d+(?:\.\d+)?%\b")
+_NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+_ELLIPSIS_RE = re.compile(r"\.{2,}|…+")
 
 
 @dataclass
@@ -179,9 +191,35 @@ def _strip_spinner_glyphs(line: str) -> str:
     return text.strip()
 
 
-def _is_status_line(line: str) -> bool:
-    """True for agent TUI token counters like ``Running 6.7k tokens``."""
-    return bool(_STATUS_LINE_RE.match(_strip_spinner_glyphs(line)))
+def status_template_key(line: str) -> str | None:
+    """Stable key for live-updating TUI status lines; ``None`` if ordinary text.
+
+    Spinners, phase verbs (Running/Waiting/…), token counters, durations, and
+    other numbers are normalized so successive frames of the same status slot
+    share a key and can replace in place — including multi-line status blocks.
+    """
+    text = _strip_spinner_glyphs(line)
+    if not text:
+        return None
+    normalized = _PHASE_RE.sub("<PHASE>", text)
+    normalized = _TOKEN_COUNT_RE.sub("<TOKENS>", normalized)
+    normalized = _DURATION_RE.sub("<TIME>", normalized)
+    normalized = _PERCENT_RE.sub("<PCT>", normalized)
+    normalized = _NUMBER_RE.sub("<NUM>", normalized)
+    normalized = _ELLIPSIS_RE.sub("…", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    strong = ("<phase>", "<tokens>", "<time>", "<pct>")
+    has_strong = any(token in normalized for token in strong)
+    # Bare numbers alone are too greedy (e.g. ``line-0-xxx`` / ``line-1-xxx``).
+    # Allow only short ratio-style counters: ``3/10``, ``2 of 5``.
+    if not has_strong:
+        if "<num>" not in normalized or len(normalized) > 40:
+            return None
+        if not re.search(r"<num>\s*/\s*<num>|<num>\s+of\s+<num>", normalized):
+            return None
+    if not re.search(r"[a-z\u4e00-\u9fff]", normalized):
+        return None
+    return normalized
 
 
 def _is_prefix_rewrite(previous: str, current: str) -> bool:
@@ -191,8 +229,31 @@ def _is_prefix_rewrite(previous: str, current: str) -> bool:
     return current.startswith(previous) or previous.startswith(current)
 
 
+def _replace_in_trailing_status_block(session: list[str], line: str, key: str) -> bool | None:
+    """Try to update a matching status slot in the trailing status region.
+
+    Returns ``True`` if replaced, ``False`` if matched but unchanged, ``None``
+    if no slot matched (caller should append).
+    """
+    for index in range(len(session) - 1, -1, -1):
+        prev_key = status_template_key(session[index])
+        if prev_key is None:
+            break
+        if prev_key != key:
+            continue
+        if session[index] == line:
+            return False
+        session[index] = line
+        return True
+    return None
+
+
 def merge_added_lines(session: list[str], added: list[str]) -> int:
-    """Merge ``added`` into ``session`` with spinner/prefix coalesce.
+    """Merge ``added`` into ``session`` with status-slot / prefix coalesce.
+
+    Live TUI status lines (spinners, token counters, ``Waiting Nm Ns for shell``,
+    etc.) update in place by template key so multi-line status blocks stay one
+    row per slot. Typing echoes still coalesce via prefix rewrite.
 
     Returns the number of mutations (append or in-place replace). A pure replace
     still counts so Discord can refresh the live bubble.
@@ -203,12 +264,18 @@ def merge_added_lines(session: list[str], added: list[str]) -> int:
             session.append(line)
             mutations += 1
             continue
-        last = session[-1]
-        if _is_status_line(line) and _is_status_line(last):
-            if last != line:
-                session[-1] = line
+        key = status_template_key(line)
+        if key is not None:
+            replaced = _replace_in_trailing_status_block(session, line, key)
+            if replaced is True:
                 mutations += 1
+                continue
+            if replaced is False:
+                continue
+            session.append(line)
+            mutations += 1
             continue
+        last = session[-1]
         if _is_prefix_rewrite(last, line):
             session[-1] = line
             mutations += 1
