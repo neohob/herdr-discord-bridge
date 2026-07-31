@@ -1,0 +1,25 @@
+# Herdr plugin manifest — Discord Bridge Gateway
+id = "herdr-discord-bridge"
+name = "Discord Bridge Gateway"
+version = "0.1.0"
+description = "TLS NDJSON gateway for Discord Bot ↔ Herdr bridging"
+
+[actions.setup]
+script = "scripts/ctl.sh"
+args = ["setup"]
+
+[actions.start]
+script = "scripts/ctl.sh"
+args = ["start"]
+
+[actions.stop]
+script = "scripts/ctl.sh"
+args = ["stop"]
+
+[actions.status]
+script = "scripts/ctl.sh"
+args = ["status"]
+
+[actions.teardown]
+script = "scripts/ctl.sh"
+args = ["teardown"]
