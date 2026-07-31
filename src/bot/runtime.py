@@ -223,13 +223,16 @@ class Runtime:
             if state.choice_message_id is not None and not is_blocked_status(status):
                 await clear_choice_message(thread, pane_id, note="_(no longer waiting)_")
             return
-        reason = "blocked" if is_blocked_status(status) else "approval prompt detected"
+        reason = "agent blocked" if is_blocked_status(status) else "检测到确认提示"
         await ensure_choice_message(
             thread,
             remote_id=remote_id,
             pane_id=pane_id,
             fingerprint=fp,
-            content=f"🔴 `{remote_id}:{pane_id}` — {reason}. Choose a response:",
+            content=(
+                f"🔘 **请选择**（点这里，不是打字）— `{remote_id}:{pane_id}`\n"
+                f"{reason}。Yes=`y` / No=`n` / Custom=自定义"
+            ),
         )
 
     async def _notify_lifecycle(

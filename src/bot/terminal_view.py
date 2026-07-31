@@ -1,4 +1,12 @@
-"""Live Terminal View messages that follow Discord prompts."""
+"""Terminal View: prompt-following scrollback with clear bot/user styling.
+
+User messages stay plain Discord chat. Bot terminal output uses Embeds
+(coloured sidebar + 「终端输出」 title) so the two are visually distinct.
+
+Within one prompt turn, Gateway sliding windows are merged into a session
+buffer; when a segment fills, it is sealed and a new Embed continues so the
+full turn remains readable by scrolling.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +14,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import discord
@@ -16,7 +24,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-DISCORD_MSG_LIMIT = 1900
+# Embed.description limit is 4096; leave room for fences / header noise.
+EMBED_BODY_LIMIT = 3500
+SEGMENT_MAX_LINES = 45
+
+COLOR_LIVE = 0x2563EB  # blue — currently updating
+COLOR_SEALED = 0x64748B  # slate — frozen history segment
+COLOR_BLOCKED = 0xDC2626  # red
 
 
 @dataclass
@@ -28,12 +42,13 @@ class _TerminalState:
     status: str = "unknown"
     remote_id: str = ""
     flush_task: asyncio.Task[None] | None = None
-    # Prompt-following session
     needs_new_message: bool = False
     anchor_message: Any | None = None
     anchor_message_id: int | None = None
     baseline_text: str | None = None
-    # Choice UI bookkeeping (message lives separately under the live terminal)
+    session_lines: list[str] = field(default_factory=list)
+    sealed_line_count: int = 0
+    segment_index: int = 0
     choice_message_id: int | None = None
     choice_fingerprint: str | None = None
 
@@ -55,12 +70,10 @@ def _get_state(thread: discord.Thread | Any, pane_id: str) -> _TerminalState:
 
 
 def get_terminal_state(thread: discord.Thread | Any, pane_id: str) -> _TerminalState:
-    """Expose in-memory state for choice UI wiring."""
     return _get_state(thread, pane_id)
 
 
 def clear_terminal_state(thread_id: int | None = None, pane_id: str | None = None) -> None:
-    """Drop in-memory coalesce state (primarily for tests)."""
     if thread_id is None and pane_id is None:
         for state in _states.values():
             if state.flush_task is not None:
@@ -79,49 +92,115 @@ def clear_terminal_state(thread_id: int | None = None, pane_id: str | None = Non
             state.flush_task.cancel()
 
 
+def merge_sliding_window(buffer: list[str], window: list[str]) -> None:
+    """Merge a Gateway sliding window into accumulated scrollback."""
+    if not window:
+        return
+    if not buffer:
+        buffer.extend(window)
+        return
+
+    for start in range(max(0, len(buffer) - len(window)), len(buffer) + 1):
+        chunk = buffer[start:]
+        n = len(chunk)
+        if n == 0:
+            buffer.extend(window)
+            return
+        if window[:n] == chunk:
+            buffer[start:] = window
+            return
+
+    for n in range(min(len(buffer), len(window)), 0, -1):
+        if buffer[-n:] == window[:n]:
+            buffer.extend(window[n:])
+            return
+
+    buffer.extend(window)
+
+
+def absorb_gateway_window(state: _TerminalState, snapshot: str) -> None:
+    window = str(snapshot or "").splitlines()
+    if state.baseline_text is not None and not state.session_lines:
+        base = state.baseline_text.splitlines()
+        if base and window[: len(base)] == base:
+            state.session_lines.extend(window[len(base) :])
+            return
+        if base:
+            probe = list(base)
+            merge_sliding_window(probe, window)
+            state.session_lines.extend(probe[len(base) :])
+            return
+    merge_sliding_window(state.session_lines, window)
+
+
 def session_body(baseline: str | None, current: str, max_lines: int) -> str:
-    """Prefer lines added after *baseline*; fall back to a sliding window."""
+    """Test helper — production uses session_lines."""
     current_lines = current.splitlines()
     if not current_lines:
         return ""
     if baseline is None:
         return "\n".join(current_lines[-max_lines:])
-
     base_lines = baseline.splitlines()
     if base_lines and current_lines[: len(base_lines)] == base_lines:
         new_lines = current_lines[len(base_lines) :]
         if not new_lines:
             return "\n".join(current_lines[-min(max_lines, 8) :])
         context = current_lines[max(0, len(base_lines) - 2) : len(base_lines)]
-        body = context + new_lines
-        return "\n".join(body[-max_lines:])
-
+        return "\n".join((context + new_lines)[-max_lines:])
     return "\n".join(current_lines[-max_lines:])
 
 
-def render_terminal_content(
+def _status_color(status: str, *, live: bool) -> int:
+    if str(status).lower() in {"blocked", "waiting", "needs_input", "need_input"}:
+        return COLOR_BLOCKED
+    return COLOR_LIVE if live else COLOR_SEALED
+
+
+def build_terminal_embed(
     *,
     remote_id: str,
     pane_id: str,
-    text: str,
     status: str,
     bridge_cfg: BridgeConfig,
-    max_lines: int | None = None,
-    baseline_text: str | None = None,
-    reply_mark: bool = False,
-) -> str:
-    limit = max_lines if max_lines is not None else bridge_cfg.terminal.max_lines
-    body = session_body(baseline_text, text, limit)
-    lines = body.splitlines()
+    lines: list[str],
+    segment_index: int,
+    live: bool,
+) -> discord.Embed:
     emoji = bridge_cfg.status_emoji.get(status, bridge_cfg.status_emoji.get("unknown", "❓"))
-    mark = " ↳" if reply_mark else ""
-    header = f"{emoji}{mark} [{remote_id}:{pane_id}] {status}"
-    content = f"```\n{header}\n{'─' * 40}\n{body}\n```"
-    while len(content) > DISCORD_MSG_LIMIT and lines:
-        lines = lines[1:]
-        body = "\n".join(lines)
-        content = f"```\n{header}\n{'─' * 40}\n{body}\n```"
-    return content
+    body_lines = list(lines)
+    body = "\n".join(body_lines)
+    # Trim to embed budget
+    while body_lines and len(body) + 8 > EMBED_BODY_LIMIT:
+        body_lines = body_lines[1:]
+        body = "\n".join(body_lines)
+
+    if live:
+        title = f"{emoji} 终端输出 · 实时"
+        if segment_index > 1:
+            title = f"{emoji} 终端输出 · 第 {segment_index} 段 · 实时"
+    else:
+        title = f"{emoji} 终端输出 · 第 {segment_index} 段"
+
+    desc = f"```\n{body}\n```" if body else "```\n(empty)\n```"
+    embed = discord.Embed(
+        title=title,
+        description=desc,
+        colour=_status_color(status, live=live),
+    )
+    embed.set_footer(text=f"Pane {remote_id}:{pane_id} · {status} · 上方是你的输入")
+    return embed
+
+
+def _lines_fit(lines: list[str], *, max_lines: int = SEGMENT_MAX_LINES) -> int:
+    """Largest prefix of *lines* that fits in one embed body."""
+    if not lines:
+        return 0
+    limit = min(len(lines), max_lines)
+    for count in range(limit, 0, -1):
+        body = "\n".join(lines[:count])
+        if len(body) + 8 <= EMBED_BODY_LIMIT:
+            return count
+    return 1
 
 
 async def begin_prompt_session(
@@ -131,7 +210,7 @@ async def begin_prompt_session(
     *,
     remote_id: str = "",
 ) -> None:
-    """Freeze the previous live message and bind the next view to *prompt_message*."""
+    """Start a new scrollback session replied under the user's prompt."""
     state = _get_state(thread, pane_id)
     if state.flush_task is not None and not state.flush_task.done():
         state.flush_task.cancel()
@@ -142,21 +221,23 @@ async def begin_prompt_session(
     state.anchor_message = prompt_message
     state.anchor_message_id = int(getattr(prompt_message, "id", 0) or 0) or None
     state.baseline_text = state.text
+    state.session_lines = []
+    state.sealed_line_count = 0
+    state.segment_index = 0
     if remote_id:
         state.remote_id = remote_id
-    # New prompt invalidates any pending choice buttons (caller also clears Discord msg).
     state.choice_fingerprint = None
 
 
-async def _post_or_edit(
+async def _post_or_edit_embed(
     thread: discord.Thread | Any,
     state: _TerminalState,
-    content: str,
+    embed: discord.Embed,
 ) -> Any:
     if state.message_id is not None and not state.needs_new_message:
         try:
             msg = await thread.fetch_message(state.message_id)
-            await msg.edit(content=content)
+            await msg.edit(content=None, embed=embed)
             return msg
         except discord.NotFound:
             state.message_id = None
@@ -166,12 +247,12 @@ async def _post_or_edit(
     anchor = state.anchor_message
     if anchor is not None and hasattr(anchor, "reply"):
         try:
-            msg = await anchor.reply(content)
+            msg = await anchor.reply(embed=embed)
         except Exception:  # noqa: BLE001
             log.debug("prompt reply failed; falling back to thread.send", exc_info=True)
             msg = None
     if msg is None:
-        msg = await thread.send(content)
+        msg = await thread.send(embed=embed)
     state.message_id = int(msg.id)
     state.needs_new_message = False
     return msg
@@ -189,15 +270,14 @@ async def apply_terminal_view(
     message_id: int | None = None,
     clock: Callable[[], float] = time.time,
 ) -> int | None:
-    """Update the live Terminal Message, coalescing edits by cooldown."""
     state = _get_state(thread, pane_id)
-    # Mapping recovery: only reuse a stored id when we are not opening a fresh prompt reply.
     if message_id is not None and not state.needs_new_message and state.message_id is None:
         state.message_id = message_id
     if remote_id:
         state.remote_id = remote_id
     state.text = text
     state.status = status or "unknown"
+    absorb_gateway_window(state, text)
 
     now = clock()
     cooldown = bridge_cfg.terminal.edit_cooldown
@@ -245,7 +325,6 @@ async def flush_terminal_view(
     *,
     clock: Callable[[], float] = time.time,
 ) -> int | None:
-    """Apply a pending Terminal View edit after cooldown."""
     state = _get_state(thread, pane_id)
     if not state.pending:
         return state.message_id
@@ -262,17 +341,55 @@ async def _flush_state(
 ) -> int | None:
     state.pending = False
     remote_id = state.remote_id or "remote"
-    content = render_terminal_content(
-        remote_id=remote_id,
-        pane_id=pane_id,
-        text=state.text,
-        status=state.status,
-        bridge_cfg=bridge_cfg,
-        baseline_text=state.baseline_text if state.anchor_message_id else None,
-        reply_mark=state.anchor_message_id is not None,
-    )
+
+    if not state.session_lines:
+        # Bootstrap from raw window when absorb produced nothing yet.
+        absorb_gateway_window(state, state.text)
+
+    pending = state.session_lines[state.sealed_line_count :]
+    if not pending and state.text:
+        pending = str(state.text).splitlines()
+
     try:
-        await _post_or_edit(thread, state, content)
+        # Seal complete segments while remainder still overflows one embed.
+        while True:
+            fit = _lines_fit(pending)
+            if fit <= 0:
+                break
+            remainder = pending[fit:]
+            whole_fits = _lines_fit(pending) >= len(pending) and len("\n".join(pending)) + 8 <= EMBED_BODY_LIMIT
+            if whole_fits or not remainder:
+                break
+            # Seal prefix, open a new message for the rest.
+            state.segment_index += 1
+            sealed = pending[:fit]
+            embed = build_terminal_embed(
+                remote_id=remote_id,
+                pane_id=pane_id,
+                status=state.status,
+                bridge_cfg=bridge_cfg,
+                lines=sealed,
+                segment_index=state.segment_index,
+                live=False,
+            )
+            await _post_or_edit_embed(thread, state, embed)
+            state.sealed_line_count += len(sealed)
+            state.needs_new_message = True
+            state.message_id = None
+            pending = remainder
+            state.last_edit = clock()
+
+        live_index = state.segment_index + 1 if state.sealed_line_count else max(1, state.segment_index or 1)
+        embed = build_terminal_embed(
+            remote_id=remote_id,
+            pane_id=pane_id,
+            status=state.status,
+            bridge_cfg=bridge_cfg,
+            lines=pending,
+            segment_index=live_index,
+            live=True,
+        )
+        await _post_or_edit_embed(thread, state, embed)
         state.last_edit = clock()
         return state.message_id
     except discord.HTTPException as exc:
