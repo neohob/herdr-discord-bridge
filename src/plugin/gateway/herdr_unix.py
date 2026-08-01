@@ -71,7 +71,9 @@ class HerdrUnixSubscriber:
     async def recv_event(self) -> dict:
         if self._reader is None:
             raise RuntimeError("HerdrUnixSubscriber is not started")
-        line = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout)
+        # No per-read timeout: Herdr may be idle for long periods between lifecycle
+        # events. Ack still uses ``self.timeout`` in ``start``.
+        line = await self._reader.readline()
         if not line:
             raise HerdrProtocolError("subscription EOF")
         payload = decode_line(line)

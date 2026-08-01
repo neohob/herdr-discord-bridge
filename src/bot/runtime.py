@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
@@ -11,11 +12,12 @@ import discord
 from src.bot.choice_detect import choice_fingerprint, is_blocked_status
 from src.bot.choice_ui import clear_choice_message, ensure_choice_message
 from src.bot.config import AppConfig
-from src.bot.discord_map import ensure_pane_thread, thread_name_for
+from src.bot.discord_map import ensure_pane_thread
 from src.bot.gateway_client import GatewayClient
 from src.bot.herdr.models import PaneInfo
 from src.bot.mapping import MappingStore, PaneMapping
 from src.bot.pane_lifecycle import is_pane_missing_error, retire_mapped_pane
+from src.bot.reconcile import reconcile_remote
 from src.bot.registry import RemoteRecord, RemoteRegistry
 from src.bot.terminal_view import apply_terminal_view, get_terminal_state
 
@@ -53,6 +55,8 @@ class Runtime:
         self.mapping = mapping or MappingStore(config.mapping_path)
         self._client_factory = client_factory
         self.clients: dict[str, GatewayClient] = {}
+        self._reconcile_task: asyncio.Task[None] | None = None
+        self._reconcile_lock = asyncio.Lock()
 
     def load_registry(self) -> None:
         """Import previously unseen configured seed remotes into the registry."""
@@ -76,6 +80,8 @@ class Runtime:
             if remote.channel_id is None:
                 continue
             await self.start_remote(remote)
+        if self._reconcile_task is None or self._reconcile_task.done():
+            self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
     async def start_remote(self, remote: RemoteRecord) -> GatewayClient:
         """Start a bound remote once and return its client."""
@@ -88,6 +94,10 @@ class Runtime:
 
         async def on_control_ready() -> None:
             await self.reenable_observe(remote.id)
+            try:
+                await self.reconcile_remote_id(remote.id)
+            except Exception:  # noqa: BLE001
+                log.exception("reconcile after control ready failed for %s", remote.id)
 
         client = self._client_factory(
             remote,
@@ -104,12 +114,52 @@ class Runtime:
 
     async def stop(self) -> None:
         """Stop every running Gateway client."""
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_task = None
         clients, self.clients = list(self.clients.values()), {}
         for client in clients:
             try:
                 await client.stop()
             except Exception:  # noqa: BLE001
                 log.exception("failed stopping Gateway client")
+
+    async def _reconcile_loop(self) -> None:
+        """Periodically sync pane.list → Discord so missed lifecycle events recover."""
+        interval = max(30, int(self.config.bridge.sync_interval or 300))
+        while True:
+            await asyncio.sleep(interval)
+            for remote_id in list(self.clients):
+                try:
+                    await self.reconcile_remote_id(remote_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    log.exception("background reconcile failed for %s", remote_id)
+
+    async def reconcile_remote_id(self, remote_id: str) -> tuple[int, int]:
+        """Map/prune panes for one remote. Returns ``(mapped, pruned)``."""
+        async with self._reconcile_lock:
+            remote = self.registry.get(remote_id)
+            client = self.clients.get(remote_id)
+            if remote is None or client is None or remote.channel_id is None:
+                return 0, 0
+            if self.config.bridge.read_only:
+                return 0, 0
+            channel = await self._fetch_channel(remote.channel_id)
+            return await reconcile_remote(
+                guild=self.guild,
+                channel=channel,
+                client=client,
+                remote=remote,
+                mapping=self.mapping,
+                bridge_cfg=self.config.bridge,
+                sleep_between=0.5,
+            )
 
     async def handle_push(self, remote_id: str, event: dict[str, Any]) -> None:
         """Route a Gateway push envelope for ``remote_id``."""
@@ -197,20 +247,11 @@ class Runtime:
         pane.agent_status = status
         self.mapping.upsert_pane(pane)
 
+        # Do not rename the Discord thread on status flips — that floods the
+        # channel audit log (🟢/🔵/✅ every few minutes). Thread titles stay
+        # stable; status is reflected in the Terminal View / choice UI only.
         thread = await self._fetch_thread(pane.thread_id)
         if thread is not None:
-            pane_info = PaneInfo(
-                pane_id=pane_id,
-                workspace_id="",
-                label=str(data.get("label") or pane.label or pane_id),
-                agent=str(data.get("agent") or ""),
-                agent_status=status,
-            )
-            try:
-                await thread.edit(name=thread_name_for(pane_info, self.config.bridge))
-            except discord.HTTPException:
-                log.exception("failed renaming pane thread %s:%s", remote_id, pane_id)
-
             state = get_terminal_state(thread, pane_id)
             await self._sync_choice_ui(
                 thread,

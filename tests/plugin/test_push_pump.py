@@ -40,25 +40,27 @@ class FakeHerdrClient:
 
 
 class FakeHerdrSubscriber:
-    """Emits a fixed sequence of Herdr events then blocks."""
+    """Emits a fixed sequence of Herdr events then blocks until closed."""
 
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = list(events)
         self.started = False
         self.subscriptions: list[dict] | None = None
+        self._closed = asyncio.Event()
 
     async def start(self, path: str, subscriptions: list[dict]) -> None:
         self.started = True
         self.subscriptions = subscriptions
+        self._closed = asyncio.Event()
 
     async def recv_event(self) -> dict:
         if self._events:
             return self._events.pop(0)
-        await asyncio.sleep(3600)
-        raise AssertionError("recv_event called with no events left")
+        await self._closed.wait()
+        raise ConnectionError("subscriber closed")
 
     async def close(self) -> None:
-        pass
+        self._closed.set()
 
 
 class EventCollectingHub(PushHub):
@@ -186,21 +188,15 @@ async def test_observe_emits_terminal_output(
             {"text": "line two", "revision": 2, "truncated": False},
         ],
     )
+    # Observe does not require the Herdr event subscriber to be running.
     pump = _make_pump(push_hub, fake_herdr, fake_subscriber)
-    run_task = asyncio.create_task(pump.run())
+    await pump.set_observe("w1:p1", True)
     try:
-        await pump.set_observe("w1:p1", True)
         ev = await push_hub.wait_event("bridge.terminal_output", timeout=2)
         assert ev["data"]["pane_id"] == "w1:p1"
         assert ev["data"]["text"] == "line one"
         assert ev["data"]["revision"] == 1
     finally:
-        await pump.set_observe("w1:p1", False)
-        run_task.cancel()
-        try:
-            await run_task
-        except asyncio.CancelledError:
-            pass
         await pump.shutdown()
 
 
@@ -215,18 +211,11 @@ async def test_observe_strips_ansi_locally(
         [{"text": "\x1b[31mred\x1b[0m", "revision": 1, "truncated": False}],
     )
     pump = _make_pump(push_hub, fake_herdr, fake_subscriber)
-    run_task = asyncio.create_task(pump.run())
+    await pump.set_observe("w1:p1", True)
     try:
-        await pump.set_observe("w1:p1", True)
         ev = await push_hub.wait_event("bridge.terminal_output", timeout=2)
         assert ev["data"]["text"] == "red"
     finally:
-        await pump.set_observe("w1:p1", False)
-        run_task.cancel()
-        try:
-            await run_task
-        except asyncio.CancelledError:
-            pass
         await pump.shutdown()
 
 
@@ -252,7 +241,6 @@ async def test_observe_coalesces_rapid_updates(
         push_cooldown=0.2,
         poll_interval=0.02,
     )
-    run_task = asyncio.create_task(pump.run())
     collected: list[dict[str, Any]] = []
 
     async def collect() -> None:
@@ -278,12 +266,6 @@ async def test_observe_coalesces_rapid_updates(
             await collector
         except asyncio.CancelledError:
             pass
-        await pump.set_observe("w1:p1", False)
-        run_task.cancel()
-        try:
-            await run_task
-        except asyncio.CancelledError:
-            pass
         await pump.shutdown()
 
 
@@ -298,7 +280,6 @@ async def test_set_observe_disable_stops_polling(
         [{"text": "once", "revision": 1, "truncated": False}],
     )
     pump = _make_pump(push_hub, fake_herdr, fake_subscriber)
-    run_task = asyncio.create_task(pump.run())
     try:
         await pump.set_observe("w1:p1", True)
         await push_hub.wait_event("bridge.terminal_output", timeout=2)
@@ -308,9 +289,57 @@ async def test_set_observe_disable_stops_polling(
         calls_after_disable = len(fake_herdr.read_calls)
         assert calls_after_disable == calls_before
     finally:
+        await pump.shutdown()
+
+
+def test_default_subscriptions_omit_bare_agent_status():
+    from src.plugin.gateway.push_pump import DEFAULT_SUBSCRIPTIONS
+
+    assert not any(
+        s.get("type") == "pane.agent_status_changed" and "pane_id" not in s
+        for s in DEFAULT_SUBSCRIPTIONS
+    )
+
+
+@pytest.mark.asyncio
+async def test_observe_adds_per_pane_agent_status_subscription(
+    push_hub: EventCollectingHub,
+    fake_herdr: FakeHerdrClient,
+):
+    """Herdr rejects global agent_status without pane_id; observe must attach it."""
+    started: list[list[dict]] = []
+
+    class RecordingSubscriber(FakeHerdrSubscriber):
+        def __init__(self) -> None:
+            super().__init__([])
+
+        async def start(self, path: str, subscriptions: list[dict]) -> None:
+            started.append(list(subscriptions))
+            await super().start(path, subscriptions)
+
+    pump = PushPump(
+        push_hub,
+        herdr_socket="/tmp/fake.sock",
+        herdr_factory=lambda: fake_herdr,
+        subscriber_factory=RecordingSubscriber,
+    )
+    run_task = asyncio.create_task(pump.run())
+    try:
+        deadline = time.monotonic() + 2
+        while not started and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert started
+        assert {"type": "pane.agent_status_changed", "pane_id": "w1:p1"} not in started[0]
+        await pump.set_observe("w1:p1", True)
+        deadline = time.monotonic() + 2
+        while len(started) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert len(started) >= 2
+        assert {"type": "pane.agent_status_changed", "pane_id": "w1:p1"} in started[-1]
+    finally:
+        await pump.shutdown()
         run_task.cancel()
         try:
             await run_task
         except asyncio.CancelledError:
             pass
-        await pump.shutdown()

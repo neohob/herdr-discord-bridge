@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any, TYPE_CHECKING
 
@@ -10,11 +9,11 @@ import discord
 from discord import app_commands
 
 from src.bot.chat_input import format_agent_anchor, forward_pane_input
-from src.bot.discord_map import ensure_pane_thread, ensure_remote_channel
-from src.bot.herdr.models import PaneInfo, extract_list
+from src.bot.discord_map import ensure_remote_channel
 from src.bot.mapping import MappingStore
 from src.bot.operators import is_operator
 from src.bot.pane_lifecycle import retire_mapped_pane
+from src.bot.reconcile import map_panes, reconcile_remote
 from src.bot.registry import RemoteRecord, RemoteRegistry
 
 if TYPE_CHECKING:
@@ -121,62 +120,6 @@ async def _ensure_client(bot: BridgeBot, remote_id: str) -> Any:
     return client if client is not None else await runtime.start_remote(remote)
 
 
-async def _workspace_labels(client: Any) -> dict[str, str]:
-    try:
-        result = await client.request("workspace.list")
-    except Exception:  # noqa: BLE001
-        return {}
-    labels: dict[str, str] = {}
-    for item in extract_list(result, "workspaces", "items"):
-        workspace_id = str(item.get("workspace_id") or item.get("id") or "")
-        label = str(item.get("label") or "").strip()
-        if workspace_id and label:
-            labels[workspace_id] = label
-    return labels
-
-
-async def _tab_labels(client: Any) -> dict[str, str]:
-    """Map tab_id → label from live ``tab.list`` (not a static table)."""
-    try:
-        result = await client.request("tab.list")
-    except Exception:  # noqa: BLE001
-        return {}
-    labels: dict[str, str] = {}
-    for item in extract_list(result, "tabs", "items"):
-        tab_id = str(item.get("tab_id") or item.get("id") or "")
-        label = str(item.get("label") or "").strip()
-        if tab_id and label:
-            labels[tab_id] = label
-    return labels
-
-
-async def _prune_stale_panes(
-    *,
-    bot: BridgeBot,
-    remote: RemoteRecord,
-    live_pane_ids: set[str],
-    guild: discord.Guild | None,
-) -> int:
-    """Archive/delete Discord threads for Pane ids that no longer exist on Herdr."""
-    pruned = 0
-    runtime = getattr(bot, "runtime", None)
-    client = runtime.clients.get(remote.id) if runtime is not None else None
-    for pane in list(bot.mapping.all_panes(remote.id)):
-        if pane.pane_id in live_pane_ids:
-            continue
-        retired = await retire_mapped_pane(
-            guild=guild,
-            mapping=bot.mapping,
-            client=client,
-            remote_id=remote.id,
-            pane_id=pane.pane_id,
-            reason=f"Herdr pane {pane.pane_id} no longer exists",
-        )
-        if retired is not None:
-            pruned += 1
-    return pruned
-
-
 async def _map_panes(
     *,
     interaction: discord.Interaction[Any],
@@ -186,27 +129,15 @@ async def _map_panes(
 ) -> int:
     channel = await _remote_channel(interaction, remote, bot.mapping)
     client = await _ensure_client(bot, remote.id)
-    workspace_labels = await _workspace_labels(client)
-    tab_labels = await _tab_labels(client)
-    mapped = 0
-    for pane_data in panes:
-        pane = PaneInfo.from_dict(pane_data)
-        if not pane.pane_id:
-            continue
-        pane.workspace_label = workspace_labels.get(pane.workspace_id, pane.workspace_label)
-        pane.tab_label = tab_labels.get(pane.tab_id, pane.tab_label)
-        await ensure_pane_thread(
-            channel,
-            pane,
-            remote_id=remote.id,
-            mapping=bot.mapping,
-            bridge_cfg=bot.config.bridge,
-        )
-        await client.observe_pane(pane.pane_id, True)
-        mapped += 1
-        # Avoid Discord thread-create 429s that stretch past interaction timeouts.
-        await asyncio.sleep(1.0)
-    return mapped
+    return await map_panes(
+        channel=channel,
+        client=client,
+        remote=remote,
+        mapping=bot.mapping,
+        bridge_cfg=bot.config.bridge,
+        panes=panes,
+        sleep_between=1.0,
+    )
 
 
 class _RebindSelect(discord.ui.Select):
@@ -508,20 +439,16 @@ def register_commands(tree: app_commands.CommandTree, bot: BridgeBot) -> None:
             await interaction.response.defer(ephemeral=True)
         try:
             client = await _ensure_client(bot, remote.id)
-            result = await client.request("pane.list")
-            panes = extract_list(result, "panes", "items")
-            live_ids = {
-                str(item.get("pane_id") or item.get("id") or "")
-                for item in panes
-                if item.get("pane_id") or item.get("id")
-            }
-            pruned = await _prune_stale_panes(
-                bot=bot,
-                remote=remote,
-                live_pane_ids=live_ids,
+            channel = await _remote_channel(interaction, remote, bot.mapping)
+            count, pruned = await reconcile_remote(
                 guild=interaction.guild,
+                channel=channel,
+                client=client,
+                remote=remote,
+                mapping=bot.mapping,
+                bridge_cfg=bot.config.bridge,
+                sleep_between=1.0,
             )
-            count = await _map_panes(interaction=interaction, bot=bot, remote=remote, panes=panes)
             msg = f"Synced {count} Pane(s) for `{remote.id}`."
             if pruned:
                 msg += f" Pruned {pruned} stale thread(s)."

@@ -47,12 +47,16 @@ def remote_channel_name(prefix: str, remote_id: str, name: str | None = None) ->
 
 
 def thread_name_for(pane: PaneInfo, bridge_cfg: BridgeConfig) -> str:
-    """Live Herdr fields only — no static lookup table.
+    """Stable Pane Thread title — no agent-status emoji.
 
-    Format: ``{emoji} {workspace} › {tab} · {name} [{pane_id}]``
-    Workspace/tab labels come from workspace.list / tab.list at sync time.
+    Format: ``{workspace} › {tab} · {name} [{pane_id}]``
+
+    Status flips (idle/working/done) every few minutes; putting them in the
+    Discord thread name floods the channel audit log. Status stays on the
+    Terminal View message instead. ``bridge_cfg`` is kept for call-site
+    compatibility.
     """
-    emoji = bridge_cfg.status_emoji.get(pane.agent_status, "❓")
+    _ = bridge_cfg
     workspace = sanitize_thread_name(pane.workspace_label or pane.workspace_id or "", max_len=28)
     tab = sanitize_thread_name(pane.tab_label or "", max_len=20)
     name = sanitize_thread_name(pane.agent or pane.label or "", max_len=32)
@@ -79,11 +83,10 @@ def thread_name_for(pane: PaneInfo, bridge_cfg: BridgeConfig) -> str:
         body = head_parts[0]
 
     suffix = f" [{pane_id}]" if pane_id else ""
-    head = f"{emoji} {body}".strip()
     budget = 100 - len(suffix)
     if budget < 8:
-        return (pane_id or head)[:100]
-    return (head[:budget].rstrip(" ·›") + suffix)[:100]
+        return (pane_id or body)[:100]
+    return (body[:budget].rstrip(" ·›") + suffix)[:100]
 
 
 async def ensure_remote_channel(

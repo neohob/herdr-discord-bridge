@@ -94,7 +94,7 @@ async def test_ensure_pane_thread_creates_thread(tmp_path):
     assert pm.thread_id == 900
 
 
-def test_thread_name_includes_status_emoji():
+def test_thread_name_is_stable_across_status():
     pane = PaneInfo(
         pane_id="wB:p6",
         workspace_id="wB",
@@ -104,11 +104,14 @@ def test_thread_name_includes_status_emoji():
         workspace_label="JinAn-MAP",
         tab_label="cursor",
     )
-    name = thread_name_for(pane, BridgeConfig())
-    assert name.startswith("🟢")
-    assert "JinAn-MAP" in name
-    assert "cursor" in name
-    assert "[wB:p6]" in name
+    idle = thread_name_for(pane, BridgeConfig())
+    pane.agent_status = "working"
+    working = thread_name_for(pane, BridgeConfig())
+    assert idle == working
+    assert not idle.startswith(("🟢", "🔵", "✅", "🔴", "❓"))
+    assert "JinAn-MAP" in idle
+    assert "cursor" in idle
+    assert "[wB:p6]" in idle
 
 
 def test_pane_label_prefers_terminal_title_and_cwd():

@@ -72,6 +72,10 @@ class FakeGatewayClient:
         self.started = False
         self.stopped = False
         self.observed: list[tuple[str, bool]] = []
+        # Keep reconcile from pruning fixtures; tests override for missing panes.
+        self.live_panes: list[dict[str, Any]] = [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "idle"},
+        ]
 
     async def start(self) -> None:
         self.started = True
@@ -83,6 +87,13 @@ class FakeGatewayClient:
 
     async def observe_pane(self, pane_id: str, enabled: bool) -> None:
         self.observed.append((pane_id, enabled))
+
+    async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        if method == "pane.list":
+            return {"panes": list(self.live_panes)}
+        if method in {"workspace.list", "tab.list"}:
+            return {}
+        return {}
 
 
 def make_config(tmp_path: Path, *, seed_remotes=None) -> AppConfig:
@@ -151,8 +162,8 @@ async def test_runtime_starts_bound_remote_routes_pushes_and_restores_observe(tm
         },
     )
     assert mapping.get_pane("lab", "w1:p1").agent_status == "working"
-    assert thread.edits
-    assert "working" in thread.edits[0] or "🔵" in thread.edits[0]
+    # Status must not rename the Discord thread (audit-log spam).
+    assert thread.edits == []
 
     created_thread = FakeThread(21)
 
