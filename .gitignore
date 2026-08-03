@@ -13,3 +13,8 @@ id_ed25519*
 
 .superpowers/
 .worktrees/
+
+# Local-only: tests, docs, logs stay on disk but are not tracked/pushed
+/tests/
+/docs/
+/logs/
