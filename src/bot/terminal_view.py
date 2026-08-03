@@ -554,6 +554,20 @@ def status_template_key(line: str) -> str | None:
     normalized = re.sub(r"\s+", " ", normalized).strip().lower()
     strong = ("<phase>", "<tokens>", "<time>", "<pct>", "<q>")
     has_strong = any(token in normalized for token in strong)
+    # pi's WorkingStatusIndicator renders ``{spinner} {message}`` where message
+    # is free-form via setWorkingMessage (Working/Booping/Thinking/... — any
+    # word, not enumerable). A leading spinner glyph + short residual text with
+    # no other strong marker is exactly that status row: give every frame of
+    # every word one shared slot so animation frames replace instead of append.
+    # Long lines (>40) are real content even if they start with a glyph; lines
+    # carrying tokens/phases/percent keep their informative key.
+    if (
+        not has_strong
+        and _SPINNER_GLYPH_RE.match(line)
+        and len(text) <= 40
+        and "\n" not in text
+    ):
+        return "<spinner-status>"
     # Bare numbers alone are too greedy (e.g. ``line-0-xxx`` / ``line-1-xxx``).
     # Allow only short ratio-style counters: ``3/10``, ``2 of 5``.
     if not has_strong:

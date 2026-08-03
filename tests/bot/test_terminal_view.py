@@ -1014,3 +1014,50 @@ def test_pwd_line_kept():
     session: list[str] = []
     assert merge_added_lines(session, ["~/Downloads/MyNextCloud/Work/herdr-discord-bridge (main)"]) == 1
     assert session == ["~/Downloads/MyNextCloud/Work/herdr-discord-bridge (main)"]
+
+
+def test_custom_status_word_frames_coalesce():
+    """User's real case: pi WorkingStatusIndicator with a custom message
+    'Booping…' and custom spinner frames ✽·✢✶✳. The word is not in any phase
+    list — the leading spinner glyph + short text is the source-verified shape
+    (setWorkingMessage is free-form). All six animation frames collapse into one
+    slot instead of appending six lines."""
+    session: list[str] = ["ok"]
+    frames = [
+        "✽ Booping…",
+        "· Booping…",
+        "✽ Booping…",
+        "✢ Booping…",
+        "✶ Booping…",
+        "✳ Booping…",
+    ]
+    for f in frames:
+        merge_added_lines(session, [f])
+    # every frame replaced the previous one → single status line, content intact
+    status_lines = [ln for ln in session if "Booping" in ln]
+    assert len(status_lines) == 1
+    assert session[0] == "ok"
+
+
+def test_status_word_with_elapsed_parens_coalesce():
+    """Qualified frames (39s · thinking some more / 44s · ↓ tokens) share the
+    <Q> slot: same word, different qualifiers → one line."""
+    session: list[str] = []
+    merge_added_lines(session, ["✢ Booping… (39s · thinking some more)"])
+    merge_added_lines(session, ["✽ Booping… (44s · ↓ 2.9k tokens)"])
+    booping = [ln for ln in session if "Booping" in ln]
+    assert len(booping) == 1
+
+
+def test_thinking_paragraph_lines_never_absorbed():
+    """Long glyph-prefixed thinking lines (⏺/❯ prefixes are in the spinner glyph
+    set) must stay: the guard is short-text-only, so real prose is untouched."""
+    session: list[str] = []
+    thinking = (
+        "⏺ 用户让我检查 task 完成状态并继续。先说明:Phase 0 的 10 个实现 task 全部完成(impl + review + final review 全"
+        " Approved)。TaskList 显示 Task 8/9/10 pending 是我没同步(双轨)。"
+    )
+    prompt = "❯ 我看你task还有没有完成的？继续呀我看你task还有没有完成的？继续呀"
+    assert merge_added_lines(session, [thinking]) == 1
+    assert merge_added_lines(session, [prompt]) == 1
+    assert session == [thinking, prompt]
