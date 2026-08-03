@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+log = logging.getLogger("src.bot.gateway_client")
 
 from src.bot.registry import RemoteRecord
 from src.shared.fingerprint import cert_sha256_fingerprint, fingerprints_match
@@ -39,6 +42,7 @@ class GatewayClient:
         min_backoff: float = 0.5,
         max_backoff: float = 30.0,
         control_heartbeat: float = 15.0,
+        push_heartbeat: float = 15.0,
     ) -> None:
         self._remote = remote
         self._on_event = on_event
@@ -46,6 +50,12 @@ class GatewayClient:
         self._min_backoff = min_backoff
         self._max_backoff = max_backoff
         self._control_heartbeat = control_heartbeat
+        # The gateway sends a `{"type":"ping"}` frame on every push session every
+        # ``push_heartbeat`` seconds. A read stall of >2.5x that interval means the
+        # peer is gone (half-open TCP) and the loop must reconnect — previously a
+        # half-open push session blocked ``readline()`` forever and terminal
+        # updates silently stopped reaching the bot.
+        self._push_read_timeout = push_heartbeat * 2.5
 
         self._stopped = asyncio.Event()
         self._control_ready = asyncio.Event()
@@ -102,11 +112,21 @@ class GatewayClient:
             try:
                 self._control_writer.write(encode_line(req))
                 await self._control_writer.drain()
-                line = await self._control_reader.readline()
+                # Bound the RPC response wait: a half-open control connection
+                # (TCP up, gateway handler gone) would otherwise block
+                # ``readline()`` forever and wedge the whole reconcile loop.
+                line = await asyncio.wait_for(
+                    self._control_reader.readline(),
+                    timeout=self._control_heartbeat * 2,
+                )
                 if not line:
                     self._mark_control_lost()
                     raise ConnectionError("control connection closed")
                 return unwrap_result(decode_line(line))
+            except asyncio.TimeoutError:
+                log.warning("control RPC %s timed out; marking control lost", method)
+                self._mark_control_lost()
+                raise ConnectionError(f"control RPC {method} timed out")
             except (ConnectionError, OSError, HerdrProtocolError):
                 self._mark_control_lost()
                 raise
@@ -255,14 +275,20 @@ class GatewayClient:
                 self._push_reader = reader
                 self._push_writer = writer
                 backoff = self._min_backoff
+                log.info(
+                    "push session connected for %s (heartbeat %.0fs, stall timeout %.0fs)",
+                    self._remote.id,
+                    self._push_read_timeout / 2.5,
+                    self._push_read_timeout,
+                )
                 await self._read_push_events(reader)
             except TlsFingerprintError as exc:
                 self._fingerprint_error = exc
                 break
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log.warning("push session failed for %s: %s", self._remote.id, exc)
             finally:
                 await self._close_push()
 
@@ -273,12 +299,27 @@ class GatewayClient:
 
     async def _read_push_events(self, reader: asyncio.StreamReader) -> None:
         while not self._stopped.is_set():
-            line = await reader.readline()
+            try:
+                line = await asyncio.wait_for(
+                    reader.readline(),
+                    timeout=self._push_read_timeout,
+                )
+            except asyncio.TimeoutError:
+                # No heartbeat frame arrived — the gateway died or the connection
+                # went half-open. Bail so the reconnect loop opens a fresh one.
+                log.warning(
+                    "push session stalled %.0fs for %s — reconnecting",
+                    self._push_read_timeout,
+                    self._remote.id,
+                )
+                break
             if not line:
                 break
             try:
                 event = decode_line(line)
             except HerdrProtocolError:
+                continue
+            if event.get("type") == "ping":
                 continue
             try:
                 await self._on_event(event)

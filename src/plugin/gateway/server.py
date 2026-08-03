@@ -34,13 +34,19 @@ class PushHub:
     def count(self) -> int:
         return len(self._writers)
 
+    # Hard cap per-writer drain: a stalled push client (e.g. the Bot's push
+    # session wedged by a Discord 429 backoff) must never block broadcast for
+    # every observed pane. On timeout the writer is dropped and the client's
+    # reconnect loop re-registers.
+    _DRAIN_TIMEOUT = 5.0
+
     async def broadcast(self, obj: dict[str, Any]) -> None:
         line = encode_line(obj)
         dead: list[asyncio.StreamWriter] = []
         for writer in self._writers:
             try:
                 writer.write(line)
-                await writer.drain()
+                await asyncio.wait_for(writer.drain(), timeout=self._DRAIN_TIMEOUT)
             except Exception:  # noqa: BLE001
                 dead.append(writer)
         for writer in dead:
@@ -130,13 +136,40 @@ async def _handle_push_session(
     push_hub: PushHub,
 ) -> None:
     push_hub.add(writer)
+    heartbeat = asyncio.create_task(_push_heartbeat_loop(writer))
     try:
         while True:
             line = await reader.readline()
             if not line:
                 break
     finally:
+        heartbeat.cancel()
         push_hub.remove(writer)
+
+
+_PUSH_HEARTBEAT = 15.0
+
+
+async def _push_heartbeat_loop(writer: asyncio.StreamWriter) -> None:
+    """Keep push sessions alive and detect dead peers.
+
+    The push channel is idle whenever the terminal is quiet, and an idle
+    tunnel (Tailscale NAT / macOS idle timeout) can silently half-open the
+    connection. A periodic frame keeps data flowing in both directions so the
+    tunnel stays up; a write failure means the peer is gone, so the writer is
+    closed and the client's read loop sees EOF and reconnects.
+    """
+    while True:
+        await asyncio.sleep(_PUSH_HEARTBEAT)
+        try:
+            writer.write(encode_line({"type": "ping"}))
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
 
 
 async def _handle_client(
