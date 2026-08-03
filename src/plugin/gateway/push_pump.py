@@ -15,9 +15,10 @@ from .server import PushHub
 
 log = logging.getLogger(__name__)
 
-# Lifecycle subscriptions are global. ``pane.agent_status_changed`` requires a
-# concrete ``pane_id`` and is attached dynamically for observed panes — including
-# it without ``pane_id`` makes Herdr reject the *entire* events.subscribe batch.
+# Lifecycle subscriptions are global. ``pane.agent_status_changed``,
+# ``pane.scroll_changed`` and ``pane.output_matched`` require a concrete
+# ``pane_id`` and are attached dynamically for observed panes — including them
+# without ``pane_id`` makes Herdr reject the *entire* events.subscribe batch.
 DEFAULT_SUBSCRIPTIONS: list[dict[str, str]] = [
     {"type": "workspace.created"},
     {"type": "workspace.closed"},
@@ -26,6 +27,14 @@ DEFAULT_SUBSCRIPTIONS: list[dict[str, str]] = [
     {"type": "pane.exited"},
     {"type": "pane.moved"},
 ]
+
+# Edge-triggered output match (herdr ``pane.output_matched``): Herdr pushes a
+# single event when a pane's recent buffer *transitions* from non-matching to
+# matching (never during a continuous match), carrying a full read snapshot.
+# We use it only as a wake-up signal so the observe loop reads immediately
+# instead of waiting out the longer poll interval — the actual pane.read still
+# happens in the observe loop, keeping one writer per pane.
+OUTPUT_MATCH_REGEX = r"\d+\s+tasks?\s*\(|Task\s+\d+|…\s*\+\d+\s+\w+"
 
 
 class PushPump:
@@ -40,7 +49,7 @@ class PushPump:
         subscriber_factory: Callable[[], Any] | None = None,
         max_lines: int = 50,
         push_cooldown: float = 1.0,
-        poll_interval: float = 0.25,
+        poll_interval: float = 1.0,
         subscriptions: list[dict[str, str]] | None = None,
     ) -> None:
         self._push_hub = push_hub
@@ -53,16 +62,29 @@ class PushPump:
         self._base_subscriptions = list(subscriptions or DEFAULT_SUBSCRIPTIONS)
         self._observe_tasks: dict[str, asyncio.Task[None]] = {}
         self._observed_panes: set[str] = set()
+        self._pane_scroll: dict[str, dict[str, Any]] = {}
+        self._match_events: dict[str, asyncio.Event] = {}
         self._shutdown = asyncio.Event()
         self._resubscribe = asyncio.Event()
         self._subscriber_min_backoff = 0.5
         self._subscriber_max_backoff = 30.0
 
-    def _build_subscriptions(self) -> list[dict[str, str]]:
-        """Lifecycle globals + per-observed-pane agent status subscriptions."""
-        subs = list(self._base_subscriptions)
+    def _build_subscriptions(self) -> list[dict[str, Any]]:
+        """Lifecycle globals + per-observed-pane dynamic subscriptions."""
+        subs: list[dict[str, Any]] = list(self._base_subscriptions)
         for pane_id in sorted(self._observed_panes):
             subs.append({"type": "pane.agent_status_changed", "pane_id": pane_id})
+            subs.append({"type": "pane.scroll_changed", "pane_id": pane_id})
+            subs.append(
+                {
+                    "type": "pane.output_matched",
+                    "pane_id": pane_id,
+                    "source": "recent",
+                    "lines": self.max_lines,
+                    "strip_ansi": False,
+                    "match": {"type": "regex", "value": OUTPUT_MATCH_REGEX},
+                }
+            )
         return subs
 
     def _request_resubscribe(self) -> None:
@@ -100,7 +122,7 @@ class PushPump:
                         exc = recv_task.exception()
                         if exc is not None:
                             raise exc
-                        await self._push_hub.broadcast(recv_task.result())
+                        await self._handle_event(recv_task.result())
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -115,6 +137,31 @@ class PushPump:
                     if asyncio.iscoroutine(maybe):
                         await maybe
 
+    async def _handle_event(self, event: dict[str, Any]) -> None:
+        """Route Herdr push events: scroll/match are Gateway-local signals; the
+        rest are forwarded verbatim to push clients."""
+        name = event.get("event")
+        data = event.get("data") or {}
+        if name == "pane.scroll_changed":
+            pane_id = str(data.get("pane_id") or "")
+            self._pane_scroll[pane_id] = data.get("scroll") or {}
+        elif name == "pane.output_matched":
+            pane_id = str(data.get("pane_id") or "")
+            self._match_events.setdefault(pane_id, asyncio.Event()).set()
+        else:
+            await self._push_hub.broadcast(event)
+
+    def _is_scrolled(self, pane_id: str) -> bool:
+        """True while the terminal user is scrolled up away from the bottom.
+
+        The ``recent`` read source is a scrollback snapshot, so scrolling does
+        not change what we read — this only gates *pushing*: while the user is
+        browsing history the latest snapshot is held (pending) and flushed the
+        moment they return to the bottom.
+        """
+        scroll = self._pane_scroll.get(pane_id) or {}
+        return int(scroll.get("offset_from_bottom") or 0) > 0
+
     async def set_observe(self, pane_id: str, enable: bool) -> None:
         """Start or stop Gateway-local terminal observe for *pane_id*."""
         if enable:
@@ -128,6 +175,8 @@ class PushPump:
             return
 
         self._observed_panes.discard(pane_id)
+        self._pane_scroll.pop(pane_id, None)
+        self._match_events.pop(pane_id, None)
         task = self._observe_tasks.pop(pane_id, None)
         if task is not None:
             task.cancel()
@@ -144,6 +193,30 @@ class PushPump:
         pane_ids = list(self._observe_tasks)
         for pane_id in pane_ids:
             await self.set_observe(pane_id, False)
+
+    async def _sleep_or_match(self, pane_id: str, duration: float | None = None) -> None:
+        """Sleep for ``duration`` (default the poll interval), or wake immediately
+        on an output match.
+
+        ``pane.output_matched`` is edge-triggered on the Herdr side, so this
+        stays quiet during a continuous match; the low-frequency poll remains
+        the reliable fallback for output that never matches.
+        """
+        delay = self.poll_interval if duration is None else duration
+        ev = self._match_events.setdefault(pane_id, asyncio.Event())
+        sleep_task = asyncio.create_task(asyncio.sleep(delay))
+        match_task = asyncio.create_task(ev.wait())
+        try:
+            await asyncio.wait(
+                {sleep_task, match_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (sleep_task, match_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleep_task, match_task, return_exceptions=True)
+        ev.clear()
 
     async def _observe_loop(self, pane_id: str) -> None:
         # Gateway-local pane.read polling — NOT exposed to Bot; replace with
@@ -191,9 +264,17 @@ class PushPump:
 
                 changed = revision != last_revision or text != last_text
                 now = time.monotonic()
+                scrolled = self._is_scrolled(pane_id)
 
                 if changed:
-                    if now - last_push >= self.push_cooldown:
+                    if scrolled:
+                        # User is browsing history: hold the newest snapshot,
+                        # replacing any older held one. Nothing is lost — the
+                        # moment they return to the bottom it is flushed.
+                        pending = (revision, text, truncated)
+                        last_revision = revision
+                        last_text = text
+                    elif now - last_push >= self.push_cooldown:
                         await self._emit_terminal_output(pane_id, revision, text, truncated)
                         last_revision = revision
                         last_text = text
@@ -202,7 +283,7 @@ class PushPump:
                     else:
                         pending = (revision, text, truncated)
 
-                if pending is not None and now - last_push >= self.push_cooldown:
+                if pending is not None and not scrolled and now - last_push >= self.push_cooldown:
                     rev, txt, trunc = pending
                     await self._emit_terminal_output(pane_id, rev, txt, trunc)
                     last_revision = rev
@@ -210,7 +291,14 @@ class PushPump:
                     last_push = time.monotonic()
                     pending = None
 
-                await asyncio.sleep(self.poll_interval)
+                # A held (pending) update must flush as soon as the push
+                # cooldown lapses — never wait out a long poll interval.
+                delay: float | None = None
+                if pending is not None and not scrolled:
+                    remaining = self.push_cooldown - (time.monotonic() - last_push)
+                    if remaining > 0:
+                        delay = min(self.poll_interval, remaining)
+                await self._sleep_or_match(pane_id, delay)
         except asyncio.CancelledError:
             if pending is not None:
                 rev, txt, trunc = pending

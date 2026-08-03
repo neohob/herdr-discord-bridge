@@ -40,13 +40,18 @@ class FakeHerdrClient:
 
 
 class FakeHerdrSubscriber:
-    """Emits a fixed sequence of Herdr events then blocks until closed."""
+    """Emits queued Herdr events; ``feed`` can inject more while running."""
 
     def __init__(self, events: list[dict[str, Any]]) -> None:
-        self._events = list(events)
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        for event in events:
+            self._queue.put_nowait(event)
         self.started = False
         self.subscriptions: list[dict] | None = None
         self._closed = asyncio.Event()
+
+    def feed(self, event: dict[str, Any]) -> None:
+        self._queue.put_nowait(event)
 
     async def start(self, path: str, subscriptions: list[dict]) -> None:
         self.started = True
@@ -54,10 +59,10 @@ class FakeHerdrSubscriber:
         self._closed = asyncio.Event()
 
     async def recv_event(self) -> dict:
-        if self._events:
-            return self._events.pop(0)
-        await self._closed.wait()
-        raise ConnectionError("subscriber closed")
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout=10)
+        except TimeoutError:
+            raise ConnectionError("subscriber closed") from None
 
     async def close(self) -> None:
         self._closed.set()
@@ -343,3 +348,134 @@ async def test_observe_adds_per_pane_agent_status_subscription(
             await run_task
         except asyncio.CancelledError:
             pass
+
+
+def test_build_subscriptions_includes_scroll_and_match():
+    """Per-pane subscriptions now include scroll_changed (pause while the user
+    browses history) and output_matched (event-driven wake-up)."""
+    pump = _make_pump(EventCollectingHub(), FakeHerdrClient(), FakeHerdrSubscriber([]))
+    pump._observed_panes.add("w1:p1")  # noqa: SLF001
+    subs = pump._build_subscriptions()
+    per_pane = [s for s in subs if "pane_id" in s]
+    assert any(s["type"] == "pane.scroll_changed" for s in per_pane)
+    matches = [s for s in per_pane if s["type"] == "pane.output_matched"]
+    assert len(matches) == 1
+    assert matches[0]["match"]["type"] == "regex"
+    assert "Task" in matches[0]["match"]["value"]
+
+
+@pytest.mark.asyncio
+async def test_scroll_changed_holds_pushes_until_bottom(
+    push_hub: EventCollectingHub,
+    fake_herdr: FakeHerdrClient,
+):
+    """While the terminal user is scrolled up, terminal output is held (not
+    broadcast); returning to the bottom flushes the newest snapshot."""
+    fake_herdr.set_reads(
+        "w1:p1",
+        [
+            {"text": "first", "revision": 1, "truncated": False},
+            {"text": "second", "revision": 2, "truncated": False},
+        ],
+    )
+    fake_sub = FakeHerdrSubscriber(
+        [
+            {"event": "pane.created", "data": {"pane_id": "w1:p1"}},
+        ]
+    )
+    pump = _make_pump(push_hub, fake_herdr, fake_sub, poll_interval=0.01)
+    run_task = asyncio.create_task(pump.run())
+    try:
+        # Scroll state is established *before* observing so no race exists
+        # between the observe loop's first read and the scroll event.
+        fake_sub.feed(
+            {
+                "event": "pane.scroll_changed",
+                "data": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "scroll": {"offset_from_bottom": 5, "max_offset_from_bottom": 40, "viewport_rows": 24},
+                },
+            }
+        )
+        await push_hub.wait_event("pane.created", timeout=2)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if (pump._pane_scroll.get("w1:p1") or {}).get("offset_from_bottom", 0) > 0:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("scroll state never applied")
+        while not push_hub.events.empty():
+            await push_hub.events.get()
+
+        await pump.set_observe("w1:p1", True)
+        # While scrolled, every read (revisions 1 and 2) is held, never pushed.
+        await asyncio.sleep(0.05)
+        assert push_hub.events.empty(), "scrolled output must be held, not pushed"
+
+        # Back to the bottom: the newest snapshot is flushed.
+        fake_sub.feed(
+            {
+                "event": "pane.scroll_changed",
+                "data": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "scroll": {"offset_from_bottom": 0, "max_offset_from_bottom": 40, "viewport_rows": 24},
+                },
+            }
+        )
+        ev = await push_hub.wait_event("bridge.terminal_output", timeout=2)
+        assert ev["data"]["text"] == "second"
+        assert ev["data"]["revision"] == 2
+    finally:
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+        await pump.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_output_matched_wakes_observe_loop(
+    push_hub: EventCollectingHub,
+    fake_herdr: FakeHerdrClient,
+):
+    """A pane.output_matched event wakes the observe loop immediately instead
+    of waiting out the poll interval."""
+    fake_herdr.set_reads(
+        "w1:p1",
+        [
+            {"text": "line one", "revision": 1, "truncated": False},
+            {"text": "10 tasks (3 running)", "revision": 2, "truncated": False},
+        ],
+    )
+    fake_sub = FakeHerdrSubscriber(
+        [
+            {"event": "pane.created", "data": {"pane_id": "w1:p1"}},
+            {
+                "event": "pane.output_matched",
+                "data": {"pane_id": "w1:p1", "matched_line": "10 tasks (3 running)"},
+            },
+        ]
+    )
+    pump = _make_pump(push_hub, fake_herdr, fake_sub, poll_interval=5.0)
+    run_task = asyncio.create_task(pump.run())
+    try:
+        await pump.set_observe("w1:p1", True)
+        # First read broadcasts immediately.
+        first = await push_hub.wait_event("bridge.terminal_output", timeout=2)
+        assert first["data"]["text"] == "line one"
+        # The 5s poll interval alone would never deliver this in time; the
+        # output_matched wake-up must fire the read immediately.
+        ev = await push_hub.wait_event("bridge.terminal_output", timeout=2)
+        assert ev["data"]["text"] == "10 tasks (3 running)"
+        assert ev["data"]["revision"] == 2
+    finally:
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+        await pump.shutdown()

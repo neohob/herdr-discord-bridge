@@ -17,6 +17,7 @@ import difflib
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -39,24 +40,295 @@ PLACEHOLDER = "思考中…"
 FLUSH_RETRY_DELAY = 1.5
 
 # TUI spinners (braille + common unicode spinners) rewritten in-place each frame.
+# Claude Code / Herdr "whirlpool" spinners cycle ✽ ✢ ✻ ✶ ✳ · on every frame, so the
+# glyph must be stripped or successive frames of one slot never share a template key.
 _BRAILLE_RE = re.compile(r"[\u2800-\u28FF]+")
-_SPINNER_GLYPH_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]+")
+_SPINNER_GLYPH_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒✽✢✻✶✳✧✦·⏺]+")
 # Live status verbs — not exhaustive; template also keys off timers/counters.
 _PHASE_RE = re.compile(
     r"\b(?:Running|Working|Thinking|Waiting|Downloading|Uploading|Building|"
     r"Compiling|Installing|Syncing|Loading|Processing|Searching|Indexing|"
-    r"Connecting|Retrying|Pending)\b",
+    r"Connecting|Retrying|Pending|Whirlpooling|Propagating|Implementing|"
+    r"Creating|Extracting|Reviewing|Verifying|Generating|Refactoring|Thought|"
+    r"Compacting|Inferring|Compressing|Summarizing|Resolving|Preparing|"
+    r"Finalizing|Deciding|Rewriting|Merging|Adjusting)\b",
     re.IGNORECASE,
 )
+# Claude Code tags slow frames "· still thinking" / "· thinking more" /
+# "· thinking some more" — the qualifier must normalize or a slot splits into
+# two keys mid-spin.
+_THINK_STATE_RE = re.compile(
+    r"\bstill\s+thinking\b|\bthinking\s+(?:more|some\s+more)\b", re.IGNORECASE
+)
+# Progress bars redraw as ▰▰▰▱▱▱▱… on every frame; only the percent is identity.
+_BAR_RE = re.compile(r"[▰▱█░▌▐]+")
+# A trailing parenthetical on a status line is transient qualifier state
+# ("(2m 11s · ↓ 3.6k tokens)", "(thinking some more)", "(thought for 30s)") and
+# must collapse so all qualifier variants of one slot share a key.
+_QUALIFIER_RE = re.compile(r"\s*\([^()]*\)\s*$")
+# Agent rows (◯ <name> <desc>… <timer>) are a live slot keyed by agent name; the
+# description truncates as the timer widens, so only the name is stable.
+_AGENT_ROW_RE = re.compile(r"^\s*◯\s+([^\s]+)")
+# TUI chrome re-inserted on full-window repaints (task lists, status bars, agent
+# rows, wrapped breadcrumbs). Identical re-insertions are deduplicated against
+# the recent tail.
+_CHROME_LINE_RE = re.compile(
+    r"^\s*(?:[⎿├└│┌┐┘─╭╮╰╯❯⏺]|◻|◯|◼|▸|▹|▶|⏵|…\s*\+\d+\s+pending|"
+    r"\(\d+\s*lines?\)|[\.\w-]+/[\w./-]+(?:\(\d+\s*lines?\))?)"
+)
+# How far back a live status slot may be found when a repaint interleaves ordinary
+# chrome (task list / status bar) between the spinner slot and the window tail.
+STATUS_SLOT_WINDOW = 12
+
+# ---- Pinned TUI rows (task panels, folded summaries) ------------------------
+# Some agents pin a panel to the bottom of the TUI (task lists, folded counts).
+# These rows are neither fully static (done-counts, checkmarks change) nor fully
+# dynamic, and they repaint as a block every frame — so exact-match chrome dedup
+# misses them (only identical lines dedup) and they re-append every frame. They
+# get template slots keyed on structure and update in place like status lines.
+_TASK_COUNT_RE = re.compile(r"^\s*\d+\s+tasks?\s*\([^)]*\)\s*$")
+_TASK_ROW_RE = re.compile(r"^\s*[◼◻✔✖⬤✓☑☐]\s+Task\s+(\d+)")
+_COLLAPSED_RE = re.compile(r"^\s*…\s*\+\d+\s+\w+\s*$")
+# Mirrors herdr's is_horizontal_rule() (src/detect/manifest.rs): a line starting
+# with ≥3 box-drawing dashes is decorative even when it carries a label
+# ("─ 完成 3 项 ─"). Keyed constant → count/label changes update in place.
+_DECOR_BAR_RE = re.compile(r"^\s*─{3,}.*─\s*$")
+# A task panel is wider than the status window; give its slots more tail to scan.
+_UI_SLOT_WINDOW = 40
+
+
+def fixed_ui_key(line: str) -> str | None:
+    """Template slot key for pinned TUI rows (task panels / folded summaries).
+
+    ``10 tasks (6 done, …)`` → ``<taskcount>``, ``◼ Task 7: …`` → ``<task:7>``
+    (keyed on the number, so checkmark changes ◼→✔ and description edits update
+    the same slot in place), ``… +5 completed`` → ``<collapsed>``. Returns
+    ``None`` for anything else — real content is never absorbed.
+    """
+    if _TASK_COUNT_RE.match(line):
+        return "<taskcount>"
+    m = _TASK_ROW_RE.match(line)
+    if m:
+        return f"<task:{m.group(1)}>"
+    if _COLLAPSED_RE.match(line):
+        return "<collapsed>"
+    if _DECOR_BAR_RE.match(line):
+        return "<decor-bar>"
+    return None
 _TOKEN_COUNT_RE = re.compile(r"\b[\d.,]+\s*[kKmM]?\s*tokens?\b", re.IGNORECASE)
 _DURATION_RE = re.compile(
     r"\b\d+\s*[hH]\s*\d+\s*[mM](?:\s*\d+\s*[sS])?\b|"
     r"\b\d+\s*[mM]\s*\d+\s*[sS]\b|"
     r"\b\d+(?:\.\d+)?\s*[hmsHMS]\b"
 )
-_PERCENT_RE = re.compile(r"\b\d+(?:\.\d+)?%\b")
+_PERCENT_RE = re.compile(r"\b\d+(?:\.\d+)?%(?=\s|$)")
 _NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 _ELLIPSIS_RE = re.compile(r"\.{2,}|…+")
+
+# ---- Terminal text sanitization (tabs / control / invisible chars) ------------
+# Tab stops: terminals default to 8. Discord plain messages collapse tabs, so we
+# expand them to spaces at terminal stops — column-aware over wide (CJK) chars.
+_TABSTOP = 8
+# Invisible zero-width / format / bidi markers: Discord renders them unpredictably
+# and counts them toward the 2000-char limit without showing them.
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+# C0/C1 control characters (Discord drops or mis-renders these). \n and \t are
+# handled separately; \r is folded away before this runs.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+# ---- Box-drawing tables: convert to Discord-native Markdown tables ------------
+# Discord renders plain messages in a proportional font, so box-drawing tables
+# (┌─┬─┐ │ ├┼┤ └┴┘) can never align there — no amount of padding fixes that.
+# Instead we detect the table structure and rewrite it as a Markdown table,
+# which Discord renders natively. Tree output (├── src / └── lib / │   dir)
+# never becomes a table: conversion requires a whole-line border row.
+_BOX_EDGE_RE = re.compile(r"^[┌─┬┐├┼┤└┴┘━]+$")  # whole-line border/separator
+_BOX_DATA_RE = re.compile(r"^\s*│")  # data row starting with a vertical bar
+_BOX_DECOR_RE = re.compile(r"^[─━]{3,}$")  # pure horizontal rule (no cells)
+_TABLE_TOP_RE = re.compile(r"^\s*┌")  # top border starts a box table
+_TABLE_BOT_RE = re.compile(r"^\s*└")  # bottom border ends a box table
+
+
+def _char_cell_width(ch: str) -> int:
+    """Display cells a character occupies in a terminal (for tab alignment)."""
+    if ch == "\n":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1
+
+
+def _expand_tabs(text: str) -> str:
+    """Expand tabs to spaces at terminal tab stops, column-aware over wide chars.
+
+    Python's ``str.expandtabs`` counts codepoints, so CJK text misaligns; this
+    counts display cells (wide/fullwidth = 2) so tabs keep terminal alignment
+    once Discord's client renders the message.
+    """
+    out: list[str] = []
+    col = 0
+    for ch in text:
+        if ch == "\t":
+            pad = _TABSTOP - (col % _TABSTOP)
+            out.append(" " * pad)
+            col += pad
+            continue
+        out.append(ch)
+        if ch == "\n":
+            col = 0
+        else:
+            col += _char_cell_width(ch)
+    return "".join(out)
+
+
+def sanitize_terminal_text(text: str) -> str:
+    """Make Pane text render predictably in Discord (idempotent).
+
+    - ``\r\n`` → ``\n``; stray ``\r`` dropped (mid-line redraw artifacts).
+    - Tabs expanded to spaces at terminal tab stops (wide-char aware).
+    - C0/C1 control chars and invisible zero-width / bidi markers stripped.
+
+    Runs once when a snapshot is absorbed, so session lines, coalescing keys,
+    and the 2000-char segmentation all see the final display text.
+    """
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "")
+    text = _INVISIBLE_RE.sub("", text)
+    text = _CONTROL_RE.sub("", text)
+    return _expand_tabs(text)
+
+
+def _row_cell_cols(row: str) -> list[int]:
+    """Display-cell column of every character (CJK wide chars occupy 2 cells)."""
+    cols: list[int] = []
+    col = 0
+    for ch in row:
+        cols.append(col)
+        col += _char_cell_width(ch)
+    return cols
+
+
+def _box_anchors(data_rows: list[str]) -> list[int]:
+    """Column anchor display-columns: cluster the │ positions across rows.
+
+    Anchors are display cells, not codepoint indexes — the terminal aligns
+    pipes by cell, so CJK content makes codepoint positions drift per row
+    while the cell columns stay identical (e.g. [0, 6, 75, 116] for all rows
+    while raw indexes are 54/60/60…).
+    """
+    positions: list[int] = []
+    for row in data_rows:
+        cols = _row_cell_cols(row)
+        positions.extend(cols[i] for i, ch in enumerate(row) if ch == "│")
+    if not positions:
+        return []
+    positions.sort()
+    clusters: list[list[int]] = []
+    for p in positions:
+        if clusters and p - clusters[-1][-1] <= 1:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    return [round(sum(c) / len(c)) for c in clusters]
+
+
+def _box_split(row: str, anchors: list[int]) -> list[str]:
+    """Slice one data row into cells at the display-column anchors."""
+    cols = _row_cell_cols(row)
+    cells: list[str] = []
+    for idx, a in enumerate(anchors):
+        end = anchors[idx + 1] if idx + 1 < len(anchors) else None
+        buf = [
+            ch
+            for i, ch in enumerate(row)
+            if a < cols[i] and (end is None or cols[i] < end)
+        ]
+        # strip stray edge pipes too: rows that drift off the anchor grid would
+        # otherwise smuggle a │ into the cell text.
+        cells.append("".join(buf).strip(" │"))
+    return cells
+
+
+def _box_merge(cells_rows: list[list[str]]) -> list[list[str]]:
+    """Fold continuation rows (empty first cell) into the previous logical row.
+
+    A wrapped table cell in the terminal becomes a full │…│…│ physical row with
+    an empty first column; Discord table cells cannot hold newlines, so we join
+    those pieces with a space instead of emitting a broken extra row.
+    """
+    merged: list[list[str]] = []
+    for row in cells_rows:
+        if merged and not row[0]:
+            prev = merged[-1]
+            for i, cell in enumerate(row):
+                if i < len(prev) and cell:
+                    prev[i] = (prev[i] + " " + cell).strip() if prev[i] else cell
+            continue
+        merged.append(list(row))
+    return merged
+
+
+def _table_block_to_markdown(block: list[str]) -> list[str]:
+    """Rewrite a contiguous box-drawing table block as Markdown (best-effort).
+
+    Returns the block untouched unless it has both a whole-line border row and
+    at least two columns, so tree output and stray box glyphs pass through.
+    """
+    if not any(_BOX_EDGE_RE.match(line) for line in block):
+        return block
+    data_rows = [line for line in block if _BOX_DATA_RE.match(line)]
+    if not data_rows:
+        return block
+    anchors = _box_anchors(data_rows)
+    # need at least 3 pipes (= 2 columns); a single-column box banner is not a
+    # table and passes through untouched.
+    if len(anchors) < 3:
+        return block
+    rows = _box_merge([_box_split(row, anchors) for row in data_rows])
+    # Drop all-empty edge columns: every data row ends with a closing │ that
+    # adds a spurious trailing cell. Keep the header's empty first cell when
+    # data rows fill it (option tables), but drop a column empty in every row.
+    while len(rows[0]) > 1 and all(r[-1] == "" for r in rows):
+        for r in rows:
+            r.pop()
+    while len(rows[0]) > 1 and all(r[0] == "" for r in rows):
+        for r in rows:
+            r.pop(0)
+    header = rows[0]
+    out = [
+        "| " + " | ".join(c.replace("|", "\\|") for c in header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for row in rows[1:]:
+        cells = (row + [""] * len(header))[: len(header)]
+        out.append("| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |")
+    return out
+
+
+def _adapt_rendered_lines(lines: list[str]) -> list[str]:
+    """Rendering-side adaptations (idempotent): box tables → Markdown, pure
+    horizontal rules → ASCII dashes. Session lines keep the original text so
+    dedup/coalescing keys stay stable; this only shapes the Discord output."""
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        # pure horizontal rule first: it is a subset of the table-edge charset,
+        # so it must win before the table-block branch absorbs it.
+        if _BOX_DECOR_RE.match(line):
+            out.append("-" * min(len(line), 12))
+            i += 1
+            continue
+        if _BOX_EDGE_RE.match(line) or _BOX_DATA_RE.match(line):
+            j = i
+            while j < n and (_BOX_EDGE_RE.match(lines[j]) or _BOX_DATA_RE.match(lines[j])):
+                j += 1
+            out.extend(_table_block_to_markdown(lines[i:j]))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return out
 
 
 @dataclass
@@ -197,10 +469,25 @@ def status_template_key(line: str) -> str | None:
     Spinners, phase verbs (Running/Waiting/…), token counters, durations, and
     other numbers are normalized so successive frames of the same status slot
     share a key and can replace in place — including multi-line status blocks.
+    Generalized over raw glyphs and qualifiers: progress bars collapse to
+    ``<pct>``, trailing parentheticals to ``<q>``, and agent rows to
+    ``<agent:name>``.
     """
+    agent = _AGENT_ROW_RE.match(line)
+    if agent:
+        return f"<agent:{agent.group(1).lower()}>"
     text = _strip_spinner_glyphs(line)
     if not text:
         return None
+    text = _THINK_STATE_RE.sub("thinking", text)
+    text = _BAR_RE.sub("", text)
+    # A trailing parenthetical is transient status (time · tokens · thinking);
+    # collapse it so "(2m 11s · ↓ 3.6k tokens)", "(2m 15s · thinking)",
+    # "(thinking some more)" and "(thought for 30s)" share one slot. Only applied
+    # to lines that already look like status (leading glyph, "·" separator, or a
+    # phase verb) so real content ending in parens is never collapsed.
+    if _SPINNER_GLYPH_RE.match(line) or "·" in line or _PHASE_RE.search(text):
+        text = _QUALIFIER_RE.sub(" <Q>", text)
     normalized = _PHASE_RE.sub("<PHASE>", text)
     normalized = _TOKEN_COUNT_RE.sub("<TOKENS>", normalized)
     normalized = _DURATION_RE.sub("<TIME>", normalized)
@@ -208,7 +495,7 @@ def status_template_key(line: str) -> str | None:
     normalized = _NUMBER_RE.sub("<NUM>", normalized)
     normalized = _ELLIPSIS_RE.sub("…", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip().lower()
-    strong = ("<phase>", "<tokens>", "<time>", "<pct>")
+    strong = ("<phase>", "<tokens>", "<time>", "<pct>", "<q>")
     has_strong = any(token in normalized for token in strong)
     # Bare numbers alone are too greedy (e.g. ``line-0-xxx`` / ``line-1-xxx``).
     # Allow only short ratio-style counters: ``3/10``, ``2 of 5``.
@@ -217,7 +504,7 @@ def status_template_key(line: str) -> str | None:
             return None
         if not re.search(r"<num>\s*/\s*<num>|<num>\s+of\s+<num>", normalized):
             return None
-    if not re.search(r"[a-z\u4e00-\u9fff]", normalized):
+    if not re.search(r"[a-z\u4e00-\u9fff]", normalized) and "<pct>" not in normalized:
         return None
     return normalized
 
@@ -229,16 +516,113 @@ def _is_prefix_rewrite(previous: str, current: str) -> bool:
     return current.startswith(previous) or previous.startswith(current)
 
 
-def _replace_in_trailing_status_block(session: list[str], line: str, key: str) -> bool | None:
-    """Try to update a matching status slot in the trailing status region.
+def _split_table_blocks(added: list[str]) -> list[list[str]]:
+    """Group added lines into single-line items and complete box-table blocks.
+
+    A complete block starts with a top border (``┌``), ends with a bottom
+    border (``└``), and contains only box-drawing lines. Anything else stays
+    as individual lines so the existing per-line merge rules apply unchanged.
+    """
+    items: list[list[str]] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if not run:
+            return
+        chunk: list[str] = []
+        for line in run:
+            chunk.append(line)
+            if _TABLE_BOT_RE.match(line):
+                items.append(chunk)
+                chunk = []
+        if chunk:
+            items.extend([ln] for ln in chunk)  # incomplete tail → plain lines
+        run.clear()
+
+    for line in added:
+        if _BOX_EDGE_RE.match(line) or _BOX_DATA_RE.match(line) or _BOX_DECOR_RE.match(line):
+            run.append(line)
+        else:
+            flush()
+            items.append([line])
+    flush()
+
+    out: list[list[str]] = []
+    for item in items:
+        if len(item) > 1 and _table_block_key(item) is not None:
+            out.append(item)
+        else:
+            out.extend([ln] for ln in item)
+    return out
+
+
+def _table_block_key(lines: list[str]) -> str | None:
+    """Identity of a complete box-table block = its top border line.
+
+    Tables repaint with the same top border while their body grows/shrinks, so
+    the top border is a stable template key; width changes (different border)
+    produce a new key and append conservatively.
+    """
+    if not lines or not _TABLE_TOP_RE.match(lines[0]) or not _TABLE_BOT_RE.match(lines[-1]):
+        return None
+    for line in lines[1:]:
+        if not (_BOX_DATA_RE.match(line) or _BOX_EDGE_RE.match(line)):
+            return None
+    return lines[0]
+
+
+def _merge_table_block(session: list[str], block: list[str]) -> int:
+    """Replace a previously displayed table with the same top border, or append.
+
+    A table that grew/shrunk by rows (new tasks, collapsed groups) otherwise
+    appends its extra rows *below the bottom border*, splitting the block.
+    Returns mutation count (1 for an in-place block update, len(block) for an
+    append, 0 when the identical block is already displayed).
+    """
+    key = _table_block_key(block)
+    assert key is not None
+    window = max(_UI_SLOT_WINDOW, len(block) + 8)
+    start = max(0, len(session) - window)
+    for index in range(len(session) - 1, start - 1, -1):
+        if session[index] != key:
+            continue
+        end = index + 1
+        while end < len(session) and (
+            _BOX_DATA_RE.match(session[end]) or _BOX_EDGE_RE.match(session[end])
+        ):
+            end += 1
+        old = session[index:end]
+        if old == block:
+            return 0
+        session[index:end] = block
+        return 1
+    session.extend(block)
+    return len(block)
+
+
+def _slot_key(line: str) -> str | None:
+    """Any template key: live status lines first, then pinned TUI rows."""
+    return status_template_key(line) or fixed_ui_key(line)
+
+
+def _replace_in_trailing_status_block(
+    session: list[str], line: str, key: str, window: int = STATUS_SLOT_WINDOW
+) -> bool | None:
+    """Update a matching live status slot in the recent tail.
+
+    Scans the last ``window`` lines, skipping ordinary lines, so a status frame
+    still replaces in place even when repainted chrome (status bar / task list)
+    sits between the spinner slot and the tail of the history. Only
+    slot-keyed lines are ever touched; real content is left alone.
 
     Returns ``True`` if replaced, ``False`` if matched but unchanged, ``None``
     if no slot matched (caller should append).
     """
-    for index in range(len(session) - 1, -1, -1):
-        prev_key = status_template_key(session[index])
+    start = max(0, len(session) - window)
+    for index in range(len(session) - 1, start - 1, -1):
+        prev_key = _slot_key(session[index])
         if prev_key is None:
-            break
+            continue
         if prev_key != key:
             continue
         if session[index] == line:
@@ -259,14 +643,22 @@ def merge_added_lines(session: list[str], added: list[str]) -> int:
     still counts so Discord can refresh the live bubble.
     """
     mutations = 0
-    for line in added:
+    for item in _split_table_blocks(added):
+        if len(item) > 1:
+            mutations += _merge_table_block(session, item)
+            continue
+        line = item[0]
         if not session:
             session.append(line)
             mutations += 1
             continue
         key = status_template_key(line)
+        window = STATUS_SLOT_WINDOW
+        if key is None:
+            key = fixed_ui_key(line)
+            window = _UI_SLOT_WINDOW
         if key is not None:
-            replaced = _replace_in_trailing_status_block(session, line, key)
+            replaced = _replace_in_trailing_status_block(session, line, key, window)
             if replaced is True:
                 mutations += 1
                 continue
@@ -280,9 +672,23 @@ def merge_added_lines(session: list[str], added: list[str]) -> int:
             session[-1] = line
             mutations += 1
             continue
+        if _is_chrome_reinsertion(session, line):
+            continue
         session.append(line)
         mutations += 1
     return mutations
+
+
+def _is_chrome_reinsertion(session: list[str], line: str) -> bool:
+    """True when a repainted TUI chrome line duplicates a recent session line.
+
+    Full-window repaints re-insert static chrome (task lists, status bars, agent
+    rows) verbatim; they are already displayed, so another copy only floods the
+    bubble. Real content is never chrome-prefixed and is never dropped here.
+    """
+    if not _CHROME_LINE_RE.match(line):
+        return False
+    return line in session[-STATUS_SLOT_WINDOW:]
 
 
 def _delta_from_baseline(base: list[str], window: list[str]) -> list[str]:
@@ -339,7 +745,7 @@ def absorb_gateway_window(state: _TurnState, snapshot: str) -> int:
     Prefer difflib window diffs so scrolled / rewritten tips cannot silently vanish.
     Never replaces earlier session_lines with only the current tip.
     """
-    snap = str(snapshot or "")
+    snap = sanitize_terminal_text(str(snapshot or ""))
     window = snap.splitlines()
     if snap == state.last_snapshot and window == state.last_window:
         return 0
@@ -391,6 +797,7 @@ def render_chat_reply(
     live: bool,
 ) -> str:
     """Plain chatbot-style body — no code fences, no heavy chrome."""
+    lines = _adapt_rendered_lines(list(lines))
     body = "\n".join(lines).rstrip()
     if continued and body:
         body = f"（续）\n{body}"
@@ -616,7 +1023,7 @@ async def apply_terminal_view(
     state.bridge_cfg = bridge_cfg
     if remote_id:
         state.remote_id = remote_id
-    state.text = text
+    state.text = sanitize_terminal_text(str(text or ""))
     state.status = status or "unknown"
     status_l = str(state.status).lower()
     if state.active and status_l not in {"working", "unknown", ""}:
