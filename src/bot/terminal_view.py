@@ -43,7 +43,7 @@ FLUSH_RETRY_DELAY = 1.5
 # Claude Code / Herdr "whirlpool" spinners cycle ✽ ✢ ✻ ✶ ✳ · on every frame, so the
 # glyph must be stripped or successive frames of one slot never share a template key.
 _BRAILLE_RE = re.compile(r"[\u2800-\u28FF]+")
-_SPINNER_GLYPH_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒✽✢✻✶✳✧✦·⏺]+")
+_SPINNER_GLYPH_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒✽✢✻✶✳✧✦·⏺▣]+")
 # Live status verbs — not exhaustive; template also keys off timers/counters.
 _PHASE_RE = re.compile(
     r"\b(?:Running|Working|Thinking|Waiting|Downloading|Uploading|Building|"
@@ -123,12 +123,13 @@ _PI_ELAPSED_RE = re.compile(
 )
 _PI_SOURCE_RE = re.compile(r"^\s*源码\s*[:：]")
 _WORKING_ONLY_RE = re.compile(r"^\s*[⠁-⣿]\s*Working\.{0,3}\s*$", re.IGNORECASE)
-_OC_SPINNER_RE = re.compile(
-    r"^\s*[▣◔◑◕◴◵◶◷]\s*\S.*·\s*\d+(?:\.\d+)?\s*s\s*$"  # opencode working row
-)
+# opencode's ``▣ {agent} · {model} · {duration}`` line (turn-summary.ts) is a
+# *scrolling* system row, one per completed turn — not fixed footer. It is kept
+# but coalesced: ▣ is in the glyph set, the duration normalizes to <TIME>, so
+# repeated turns of the same agent+model replace in place instead of stacking.
 _OC_DIVIDER_RE = re.compile(r"^\s*╹▀+")
 _OC_STATUS_RE = re.compile(
-    r"^\s*/[\w./-]+\s+\d[\d.,]*\s*[KkMm]?\s*\(\s*\d+\s*%\s*\)\s+ctrl\+p"
+    r"^\s*/[\w./~-]+\s+\d[\d.,]*\s*[KkMm]?\s*(?:\(\s*\d+\s*%\s*\))?\s+ctrl\+p"
 )
 _CC_HELP_RE = re.compile(r"^\s*⏵+\s*\S.*(?:permissions|shift\+tab|for agents)")
 
@@ -147,7 +148,6 @@ def _is_tui_footer_chrome(line: str) -> bool:
         or _PI_EXT_RE.match(line)
         or _PI_ELAPSED_RE.match(line)
         or _PI_SOURCE_RE.match(line)
-        or _OC_SPINNER_RE.match(line)
         or _OC_DIVIDER_RE.match(line)
         or _OC_STATUS_RE.match(line)
         or _CC_HELP_RE.match(line)

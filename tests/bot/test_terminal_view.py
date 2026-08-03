@@ -943,7 +943,8 @@ def test_tui_footer_chrome_dropped_pi():
 
 def test_tui_footer_chrome_dropped_opencode_claude():
     """opencode's ╹▀ divider + ctrl+p status bar and claude's bypass-permissions
-    prompt band are footer chrome, not reply content."""
+    prompt band are footer chrome and dropped. The ▣ turn summary is a scrolling
+    system row (turn-summary.ts), not footer — it is kept (and coalesced)."""
     session: list[str] = ["ok"]
     added = [
         "     ▣  Plan · DeepSeek V4 Flash Free (New) · 27.9s",
@@ -951,8 +952,20 @@ def test_tui_footer_chrome_dropped_opencode_claude():
         "   /Users/neo/Downloads/MyNextCloud/Work/OpenFDE 151.2K (76%)  ctrl+p commands    • OpenCode 1.18.9",
         "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
     ]
-    assert merge_added_lines(session, added) == 0
-    assert session == ["ok"]
+    assert merge_added_lines(session, added) == 1
+    assert session == ["ok", "     ▣  Plan · DeepSeek V4 Flash Free (New) · 27.9s"]
+
+
+def test_opencode_turn_summaries_coalesce_per_turn():
+    """Source: turn-summary.ts renders `▣ {agent} · {model} · {duration}` after
+    every completed turn. Successive turns of the same agent+model must replace
+    in place (duration changes), never stack."""
+    session: list[str] = []
+    merge_added_lines(session, ["     ▣  Plan · DeepSeek V4 Flash Free (New) · 27.9s"])
+    merge_added_lines(session, ["     ▣  Plan · DeepSeek V4 Flash Free (New) · 41.2s"])
+    turn_lines = [ln for ln in session if "Plan" in ln]
+    assert len(turn_lines) == 1
+    assert "41.2s" in turn_lines[0]
 
 
 def test_footer_chrome_never_absorbs_real_content():
@@ -1061,3 +1074,15 @@ def test_thinking_paragraph_lines_never_absorbed():
     assert merge_added_lines(session, [thinking]) == 1
     assert merge_added_lines(session, [prompt]) == 1
     assert session == [thinking, prompt]
+
+
+def test_claude_any_status_word_coalesces():
+    """Claude Code's braille spinner + arbitrary status word (Working/Thinking/
+    reasoning/…) repaints each frame. The <spinner-status> slot collapses every
+    frame of every word — the word list must never be the mechanism."""
+    session: list[str] = ["ok"]
+    for frame in ("⠋ Working…", "⠙ Working…", "⠹ Working…", "⠸ Thinking…"):
+        merge_added_lines(session, [frame])
+    status = [ln for ln in session if ln.strip().startswith(("⠋", "⠙", "⠹", "⠸"))]
+    assert len(status) <= 1
+    assert session[0] == "ok"
