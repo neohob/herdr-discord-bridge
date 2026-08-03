@@ -105,14 +105,22 @@ _UI_SLOT_WINDOW = 40
 # raw screen text — and its screen snapshot carries no styling (ScreenTextCell
 # holds graphemes only), so the dim marking is lost before the bot sees it.
 # These rows repaint every frame and are never part of the reply, so they are
-# dropped outright. Patterns are keyed to each agent's rendered text structure;
-# real content matching them is vanishingly rare (a lone ``Working`` line, an
-# ``↑…↓…CH%`` token line, a ``源码：`` note, a ``╹▀`` divider, a ctrl+p status
-# bar, a ``bypass permissions`` hint).
+# dropped outright. Patterns are keyed to each agent's *source-verified* render
+# structure: pi's FooterComponent.render() (pwd/stats/extension-status lines,
+# all ``theme.fg("dim")``), pi's WorkingStatusIndicator (Loader spinner frames
+# ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ + ``Working...``), pi's bash tool tail (running
+# ``Elapsed 0.0s`` — the completed ``Took 5.2s`` line is reply content and is
+# kept), plus observed opencode/claude status bands (opencode is a compiled
+# binary; its ╹▀ divider, ctrl+p status bar and ▣ spinner row and claude's
+# bypass-permissions prompt band were captured from live screens). Real content
+# matching any of these is vanishingly rare.
 _PI_STATS_RE = re.compile(
-    r"^\s*↑.*↓.*CH\d+(?:\.\d+)?%"  # pi token/context stats: ↑…↓…CH%…
+    r"^\s*↑\S+\s+↓\S+"  # pi stats: ↑tok ↓tok [R..] [CH..%] pct%/window (model)
 )
 _PI_EXT_RE = re.compile(r"^\s*[🧠🔌⚡]\S*\s+.*MCP\s*:\s*\d+\s+servers?", re.IGNORECASE)
+_PI_ELAPSED_RE = re.compile(
+    r"^\s*Elapsed\s+\d+(?:\.\d+)?\s*s\s*$"  # bash tool still running (muted)
+)
 _PI_SOURCE_RE = re.compile(r"^\s*源码\s*[:：]")
 _WORKING_ONLY_RE = re.compile(r"^\s*[⠁-⣿]\s*Working\.{0,3}\s*$", re.IGNORECASE)
 _OC_SPINNER_RE = re.compile(
@@ -137,6 +145,7 @@ def _is_tui_footer_chrome(line: str) -> bool:
         _WORKING_ONLY_RE.match(line)
         or _PI_STATS_RE.match(line)
         or _PI_EXT_RE.match(line)
+        or _PI_ELAPSED_RE.match(line)
         or _PI_SOURCE_RE.match(line)
         or _OC_SPINNER_RE.match(line)
         or _OC_DIVIDER_RE.match(line)

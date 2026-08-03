@@ -981,3 +981,36 @@ def test_pi_stats_with_varying_numbers_still_dropped():
     ):
         assert merge_added_lines(session, [frame]) == 0
     assert session == ["content"]
+
+
+def test_pi_stats_without_cache_hit_rate_still_dropped():
+    """Source: FooterComponent.render() only pushes CH% when cacheRead>0. A fresh
+    session's stats line has no CH — the ↑↓+model structure alone is chrome."""
+    session: list[str] = ["content"]
+    for frame in (
+        "↑1.2k ↓300 12%/32k (auto)                                    (deepseek) deepseek-v4-flash",
+        "↑1.3k ↓310 13%/32k (auto)                                    (deepseek) deepseek-v4-flash",
+    ):
+        assert merge_added_lines(session, [frame]) == 0
+    assert session == ["content"]
+
+
+def test_bash_elapsed_dropped_but_took_kept():
+    """Source: core/tools/bash.js appends `Elapsed 0.0s` (muted, repaints every
+    frame while the tool runs) vs `Took 5.2s` once on completion. Elapsed is
+    running-state chrome; Took is reply content."""
+    session: list[str] = []
+    assert merge_added_lines(session, [" Elapsed 0.0s"]) == 0
+    assert merge_added_lines(session, [" Elapsed 12.3s"]) == 0
+    assert session == []
+    assert merge_added_lines(session, [" Took 5.2s"]) == 1
+    assert session == [" Took 5.2s"]
+
+
+def test_pwd_line_kept():
+    """The footer pwd line (~path (branch)) is dim chrome but its shape is too
+    close to real content to filter — it is stable across frames anyway, so the
+    diff window rarely re-sends it. Assert we deliberately keep it."""
+    session: list[str] = []
+    assert merge_added_lines(session, ["~/Downloads/MyNextCloud/Work/herdr-discord-bridge (main)"]) == 1
+    assert session == ["~/Downloads/MyNextCloud/Work/herdr-discord-bridge (main)"]
