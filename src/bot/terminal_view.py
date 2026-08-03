@@ -96,6 +96,54 @@ _DECOR_BAR_RE = re.compile(r"^\s*─{3,}.*─\s*$")
 # A task panel is wider than the status window; give its slots more tail to scan.
 _UI_SLOT_WINDOW = 40
 
+# ---- TUI footer chrome (per-agent fixed bottom regions) -----------------------
+# Every coding-agent TUI pins a fixed footer to the bottom of its screen:
+# pi renders pwd + token/context stats + extension statuses (all ``theme.fg(
+# "dim")``), opencode renders a spinner row + status bar under a ``╹▀`` divider,
+# claude code renders a ``─── ❯ ───`` prompt band with a help line. herdr does
+# not filter these — it only detects agent Working/Idle state and forwards the
+# raw screen text — and its screen snapshot carries no styling (ScreenTextCell
+# holds graphemes only), so the dim marking is lost before the bot sees it.
+# These rows repaint every frame and are never part of the reply, so they are
+# dropped outright. Patterns are keyed to each agent's rendered text structure;
+# real content matching them is vanishingly rare (a lone ``Working`` line, an
+# ``↑…↓…CH%`` token line, a ``源码：`` note, a ``╹▀`` divider, a ctrl+p status
+# bar, a ``bypass permissions`` hint).
+_PI_STATS_RE = re.compile(
+    r"^\s*↑.*↓.*CH\d+(?:\.\d+)?%"  # pi token/context stats: ↑…↓…CH%…
+)
+_PI_EXT_RE = re.compile(r"^\s*[🧠🔌⚡]\S*\s+.*MCP\s*:\s*\d+\s+servers?", re.IGNORECASE)
+_PI_SOURCE_RE = re.compile(r"^\s*源码\s*[:：]")
+_WORKING_ONLY_RE = re.compile(r"^\s*[⠁-⣿]\s*Working\.{0,3}\s*$", re.IGNORECASE)
+_OC_SPINNER_RE = re.compile(
+    r"^\s*[▣◔◑◕◴◵◶◷]\s*\S.*·\s*\d+(?:\.\d+)?\s*s\s*$"  # opencode working row
+)
+_OC_DIVIDER_RE = re.compile(r"^\s*╹▀+")
+_OC_STATUS_RE = re.compile(
+    r"^\s*/[\w./-]+\s+\d[\d.,]*\s*[KkMm]?\s*\(\s*\d+\s*%\s*\)\s+ctrl\+p"
+)
+_CC_HELP_RE = re.compile(r"^\s*⏵+\s*\S.*(?:permissions|shift\+tab|for agents)")
+
+
+def _is_tui_footer_chrome(line: str) -> bool:
+    """True for fixed TUI footer rows that must never reach Discord.
+
+    These are agent-rendered screen chrome (spinner ``Working`` status, pi token
+    stats, opencode status bar, claude prompt band), not reply content. They
+    repaint every frame; without this gate the status-slot machinery can still
+    re-append them when the diff window slides past the previous frame.
+    """
+    return bool(
+        _WORKING_ONLY_RE.match(line)
+        or _PI_STATS_RE.match(line)
+        or _PI_EXT_RE.match(line)
+        or _PI_SOURCE_RE.match(line)
+        or _OC_SPINNER_RE.match(line)
+        or _OC_DIVIDER_RE.match(line)
+        or _OC_STATUS_RE.match(line)
+        or _CC_HELP_RE.match(line)
+    )
+
 
 def fixed_ui_key(line: str) -> str | None:
     """Template slot key for pinned TUI rows (task panels / folded summaries).
@@ -648,6 +696,10 @@ def merge_added_lines(session: list[str], added: list[str]) -> int:
             mutations += _merge_table_block(session, item)
             continue
         line = item[0]
+        if _is_tui_footer_chrome(line):
+            # TUI footer rows (spinner Working, pi stats, opencode status bar,
+            # claude prompt band) are fixed screen chrome, never reply content.
+            continue
         if not session:
             session.append(line)
             mutations += 1

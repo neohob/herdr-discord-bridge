@@ -925,3 +925,59 @@ def test_incomplete_table_parts_stay_plain_lines():
     # top border appends (plain-line behavior, no block splicing)
     assert merge_added_lines(session, top_only) == 1
     assert session == data_only + ["┌───┬──────┐"]
+
+
+def test_tui_footer_chrome_dropped_pi():
+    """pi's fixed footer rows never reach Discord: spinner Working status, token
+    stats, extension/MCP status, and the 源码： note between decor bars."""
+    session: list[str] = ["line one", "line two"]
+    added = [
+        " ⠹ Working...",
+        "↑2.1M ↓373k R36M CH99.3% 84.7%/128k (auto)                                                    (deepseek) deepseek-v4-flash",
+        "🧠 agentmemory 🔌 MCP: 7 servers enabled (1 connected)",
+        "源码：https://github.com/earendil-works/pi  https://github.com/anomalyco/opencode   ,claude code 5个月前的源码：https://github.com/neohob/claude-code",
+    ]
+    assert merge_added_lines(session, added) == 0
+    assert session == ["line one", "line two"]
+
+
+def test_tui_footer_chrome_dropped_opencode_claude():
+    """opencode's ╹▀ divider + ctrl+p status bar and claude's bypass-permissions
+    prompt band are footer chrome, not reply content."""
+    session: list[str] = ["ok"]
+    added = [
+        "     ▣  Plan · DeepSeek V4 Flash Free (New) · 27.9s",
+        "   ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+        "   /Users/neo/Downloads/MyNextCloud/Work/OpenFDE 151.2K (76%)  ctrl+p commands    • OpenCode 1.18.9",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    ]
+    assert merge_added_lines(session, added) == 0
+    assert session == ["ok"]
+
+
+def test_footer_chrome_never_absorbs_real_content():
+    """Status-like real content is preserved: token-bearing Working lines (info),
+    plain Working sentences, paths with percentages, and '源码' in prose."""
+    session: list[str] = []
+    added = [
+        " ⠰⠳ Working  26.39k tokens",            # informative status → slot, kept
+        "Working on the merge now",                # prose sentence
+        "docs/verify.ts 42% coverage",             # path + percent, no ctrl+p
+        "源码里没有这个函数",                        # prose containing 源码
+        "build ↓ 12% slower after cache",          # ↓ but no ↑/CH%/model parens
+    ]
+    assert merge_added_lines(session, added) == len(added)
+    assert session == added
+
+
+def test_pi_stats_with_varying_numbers_still_dropped():
+    """The stats line repaints every frame with different numbers; every variant
+    is chrome and must be dropped, never appended."""
+    session: list[str] = ["content"]
+    for frame in (
+        "↑2.1M ↓373k R36M CH99.3% 84.7%/128k (auto) (deepseek) deepseek-v4-flash",
+        "↑2.2M ↓374k R36M CH99.1% 85.1%/128k (auto) (deepseek) deepseek-v4-flash",
+        "↑2.3M ↓375k R37M CH98.9% 85.9%/128k (auto) (deepseek) deepseek-v4-flash",
+    ):
+        assert merge_added_lines(session, [frame]) == 0
+    assert session == ["content"]
