@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -125,6 +126,33 @@ class PushPump:
                         await self._handle_event(recv_task.result())
             except asyncio.CancelledError:
                 raise
+            except HerdrApiError as exc:
+                # A pane referenced by the per-pane subscriptions may have
+                # been closed between the observe-set change and this
+                # subscribe call — Herdr rejects the *entire* batch with
+                # ``pane_not_found``. Without dropping the stale pane we'd
+                # loop forever on the same dead subscription list (each retry
+                # re-sends the same pane_id), spamming push clients with
+                # spurious created/closed snapshots. Drop it and retry
+                # immediately with a reset backoff.
+                if exc.code == "pane_not_found":
+                    m = re.search(r"pane\s+(\S+)\s+not found", exc.message)
+                    stale_pane = m.group(1) if m else None
+                    if stale_pane and stale_pane in self._observed_panes:
+                        log.warning(
+                            "dropping stale pane %s from subscriptions after pane_not_found; resubscribing",
+                            stale_pane,
+                        )
+                        self._observed_panes.discard(stale_pane)
+                        task = self._observe_tasks.pop(stale_pane, None)
+                        if task is not None and not task.done():
+                            task.cancel()
+                        backoff = self._subscriber_min_backoff
+                        continue
+                log.exception("Herdr event subscriber failed; retrying in %.1fs", backoff)
+                if not self._shutdown.is_set():
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._subscriber_max_backoff)
             except Exception:  # noqa: BLE001
                 log.exception("Herdr event subscriber failed; retrying in %.1fs", backoff)
                 if not self._shutdown.is_set():
@@ -140,16 +168,58 @@ class PushPump:
     async def _handle_event(self, event: dict[str, Any]) -> None:
         """Route Herdr push events: scroll/match are Gateway-local signals; the
         rest are forwarded verbatim to push clients."""
-        name = event.get("event")
+        name = (event.get("event") or "").replace(".", "_")
         data = event.get("data") or {}
-        if name == "pane.scroll_changed":
+        log.debug("_handle_event received: event=%r name(normalized)=%r", event.get("event"), name)
+        if name == "pane_scroll_changed":
             pane_id = str(data.get("pane_id") or "")
             self._pane_scroll[pane_id] = data.get("scroll") or {}
-        elif name == "pane.output_matched":
+        elif name == "pane_output_matched":
             pane_id = str(data.get("pane_id") or "")
             self._match_events.setdefault(pane_id, asyncio.Event()).set()
+        elif name == "pane_created":
+            # Herdr's events.subscribe re-broadcasts a full pane.created
+            # snapshot on every (re)subscribe, and that snapshot can carry
+            # *stale* pane_ids that Herdr's session.json still references
+            # but which no longer exist (pane.list doesn't include them).
+            # Forwarding a stale created event makes the bot map + observe a
+            # dead pane → observe_loop pane_not_found → resubscribe → another
+            # snapshot → flooding Discord with created/closed churn. Validate
+            # the pane actually exists before forwarding.
+            pane = data.get("pane") or {}
+            pane_id = str(pane.get("pane_id") or "")
+            if pane_id and not await self._pane_exists(pane_id):
+                log.info("filtering stale pane.created %s from push (pane_not_found)", pane_id)
+                return
+            await self._push_hub.broadcast(event)
         else:
             await self._push_hub.broadcast(event)
+
+    async def _pane_exists(self, pane_id: str) -> bool:
+        """Probe Herdr for a pane's existence (pane.read on a dead pane_id
+        raises pane_not_found). Used to filter stale pane.created snapshots."""
+        herdr = self._herdr_factory()
+        try:
+            connect = getattr(herdr, "connect", None)
+            if connect is not None:
+                maybe = connect(self._herdr_socket)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            await herdr.request(
+                "pane.read",
+                {"pane_id": pane_id, "source": "recent", "lines": 1, "strip_ansi": False},
+            )
+            return True
+        except HerdrApiError as exc:
+            if str(exc.code) == "pane_not_found" or "pane_not_found" in str(exc):
+                return False
+            raise
+        finally:
+            close = getattr(herdr, "close", None)
+            if close is not None:
+                maybe = close()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
 
     def _is_scrolled(self, pane_id: str) -> bool:
         """True while the terminal user is scrolled up away from the bottom.
@@ -170,8 +240,17 @@ class PushPump:
             existing = self._observe_tasks.get(pane_id)
             if existing is None or existing.done():
                 self._observe_tasks[pane_id] = asyncio.create_task(self._observe_loop(pane_id))
-            if changed:
-                self._request_resubscribe()
+            # Do NOT resubscribe here. The per-pane subscriptions built from
+            # _observed_panes are an optimization (scroll/match wake-ups);
+            # the observe loop's pane.read poll is authoritative and does not
+            # depend on them. Resubscribing on every set_observe means a *stale*
+            # pane_id (one Herdr has already closed but the bot hasn't unmapped
+            # yet) makes Herdr reject the *entire* events.subscribe batch with
+            # pane_not_found, and every successful retry re-broadcasts a full
+            # pane.created/exited snapshot to push clients — flooding Discord
+            # with created/closed churn. Per-pane subscriptions are added
+            # lazily by _observe_loop after the first *successful* pane.read
+            # (which proves the pane exists).
             return
 
         self._observed_panes.discard(pane_id)
@@ -250,7 +329,13 @@ class PushPump:
                         log.warning("observe stopped; pane %s gone (%s)", pane_id, exc)
                         self._observed_panes.discard(pane_id)
                         self._observe_tasks.pop(pane_id, None)
-                        self._request_resubscribe()
+                        # Do NOT resubscribe: churning the Herdr event stream
+                        # to drop a per-pane subscription re-triggers a full
+                        # pane.created/exited snapshot broadcast, which the bot
+                        # re-maps/re-retires — flooding Discord. The stale pane
+                        # is already discarded from _observed_panes; the next
+                        # legitimate resubscribe (a *live* pane's first
+                        # successful read) will simply not include it.
                         return
                     raise
                 if isinstance(read, dict) and "read" in read:
@@ -261,6 +346,14 @@ class PushPump:
                 text = strip_ansi(str(read.get("text") or ""))
                 revision = int(read.get("revision") or 0)
                 truncated = bool(read.get("truncated", False))
+
+                # First successful read for this pane: now that we know it
+                # exists, request a resubscribe so per-pane subscriptions
+                # (scroll/match wake-ups) get attached. We deferred this from
+                # set_observe precisely so a stale pane_id can never poison the
+                # events.subscribe batch with pane_not_found.
+                if last_revision is None:
+                    self._request_resubscribe()
 
                 changed = revision != last_revision or text != last_text
                 now = time.monotonic()
